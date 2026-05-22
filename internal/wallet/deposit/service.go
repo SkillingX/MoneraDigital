@@ -205,12 +205,16 @@ func (s *Service) ProcessOne(ctx context.Context) (processed bool, err error) {
 	if coinChain.Chain != nil {
 		networkFamily = coinChain.Chain.NetworkFamily
 	}
+	var symbol string
+	if coinChain.Coin != nil {
+		symbol = coinChain.Coin.Symbol
+	}
 	userID, found, err := s.repo.LookupAddressOwner(ctx, d.DestinationAddress, networkFamily)
 	if err != nil {
 		return true, fmt.Errorf("lookup address owner: %w", err)
 	}
 	if !found {
-		procErr, cErr := s.flagAndFinalize(ctx, tx1, evt, &d, 0, coinChain.ChainCode, "", coinChain.ID, ReasonAddressUnassigned, &alerts)
+		procErr, cErr := s.flagAndFinalize(ctx, tx1, evt, &d, 0, coinChain.ChainCode, symbol, coinChain.ID, ReasonAddressUnassigned, &alerts)
 		committed1 = cErr == nil
 		if cErr != nil {
 			return true, cErr
@@ -222,10 +226,6 @@ func (s *Service) ProcessOne(ctx context.Context) (processed bool, err error) {
 	amount, err := decimal.NewFromString(d.TxAmount)
 	if err != nil {
 		return true, fmt.Errorf("parse txAmount %q: %w", d.TxAmount, err)
-	}
-	var symbol string
-	if coinChain.Coin != nil {
-		symbol = coinChain.Coin.Symbol
 	}
 	minAmount, err := decimal.NewFromString(coinChain.MinDepositAmount)
 	if err != nil {
@@ -299,7 +299,7 @@ func (s *Service) ProcessOne(ctx context.Context) (processed bool, err error) {
 				level: "WARN",
 				title: "Deposit failed",
 				fields: map[string]string{
-					"userId":             fmt.Sprintf("%d", userID),
+					"userId":             formatUserID(userID),
 					"txKey":              d.TxKey,
 					"amount":             d.TxAmount,
 					"symbol":             symbol,
@@ -625,7 +625,7 @@ func (s *Service) flagManualReview(
 			fields: map[string]string{
 				"reason":             reason,
 				"eventId":            evt.EventID,
-				"userId":             fmt.Sprintf("%d", userID),
+				"userId":             formatUserID(userID),
 				"destinationAddress": d.DestinationAddress,
 				"amount":             d.TxAmount,
 				"coinKey":            d.CoinKey,
@@ -979,6 +979,13 @@ func convertAlertReports(list []AMLKYTAlertReport) []safeheron.AmlReport {
 // warnIfTerminalState absorbs ErrDepositTerminalState (CREDITED/FAILED cannot
 // be overwritten — log and move on). Any other error is returned as-is for the
 // caller to propagate. D-41.
+func formatUserID(id int) string {
+	if id == 0 {
+		return "N/A"
+	}
+	return fmt.Sprintf("%d", id)
+}
+
 func warnIfTerminalState(err error, depID int64, target string) error {
 	if errors.Is(err, ErrDepositTerminalState) {
 		log.Printf("[WARN] attempted to overwrite terminal deposit status (id=%d, target=%s)", depID, target)

@@ -2,10 +2,14 @@ package alert
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -40,6 +44,12 @@ var errAlertEmailFailed = &emailFailErr{}
 type emailFailErr struct{}
 
 func (e *emailFailErr) Error() string { return "email failed" }
+
+func feishuOKHandler(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(`{"code":0,"msg":"success"}`))
+}
 
 func TestClassifyAlertPrefix(t *testing.T) {
 	tests := []struct {
@@ -102,11 +112,11 @@ func TestAlertService_FeishuPOSTsJSON(t *testing.T) {
 		var m map[string]any
 		_ = json.Unmarshal(body, &m)
 		captured.Store(&m)
-		w.WriteHeader(http.StatusOK)
+		feishuOKHandler(w, r)
 	}))
 	defer srv.Close()
 
-	a := NewAlertService(srv.URL, nil, nil)
+	a := NewAlertService(srv.URL, "", nil, nil)
 	a.Send("ERROR", "Test", map[string]string{"reason": "X"})
 
 	got := captured.Load()
@@ -122,9 +132,110 @@ func TestAlertService_FeishuPOSTsJSON(t *testing.T) {
 	}
 }
 
+func TestAlertService_FeishuSigning_AddsTimestampAndSign(t *testing.T) {
+	const secret = "test-secret"
+	var captured atomic.Pointer[map[string]any]
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var m map[string]any
+		_ = json.Unmarshal(body, &m)
+		captured.Store(&m)
+		feishuOKHandler(w, r)
+	}))
+	defer srv.Close()
+
+	a := NewAlertService(srv.URL, secret, nil, nil)
+	a.Send("ERROR", "Test", nil)
+
+	got := captured.Load()
+	if got == nil {
+		t.Fatal("feishu endpoint not hit")
+	}
+
+	tsRaw, ok := (*got)["timestamp"]
+	if !ok {
+		t.Fatal("missing timestamp field in signed request")
+	}
+	signRaw, ok := (*got)["sign"]
+	if !ok {
+		t.Fatal("missing sign field in signed request")
+	}
+
+	ts := tsRaw.(string)
+	sign := signRaw.(string)
+
+	// Verify signature: HMAC-SHA256(key=ts+"\n"+secret, message="")
+	mac := hmac.New(sha256.New, []byte(ts+"\n"+secret))
+	expected := base64.StdEncoding.EncodeToString(mac.Sum(nil))
+	if sign != expected {
+		t.Errorf("sign mismatch: got %q, want %q", sign, expected)
+	}
+
+	// Timestamp must be within last 10 seconds
+	tsInt, err := strconv.ParseInt(ts, 10, 64)
+	if err != nil {
+		t.Fatalf("timestamp not an integer: %q", ts)
+	}
+	age := time.Now().Unix() - tsInt
+	if age < 0 || age > 10 {
+		t.Errorf("timestamp too old or in future: age=%ds", age)
+	}
+}
+
+func TestAlertService_FeishuNoSigning_OmitsTimestampAndSign(t *testing.T) {
+	var captured atomic.Pointer[map[string]any]
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var m map[string]any
+		_ = json.Unmarshal(body, &m)
+		captured.Store(&m)
+		feishuOKHandler(w, r)
+	}))
+	defer srv.Close()
+
+	a := NewAlertService(srv.URL, "", nil, nil)
+	a.Send("ERROR", "Test", nil)
+
+	got := captured.Load()
+	if got == nil {
+		t.Fatal("feishu endpoint not hit")
+	}
+	if _, ok := (*got)["timestamp"]; ok {
+		t.Error("timestamp should not be present when no secret configured")
+	}
+	if _, ok := (*got)["sign"]; ok {
+		t.Error("sign should not be present when no secret configured")
+	}
+}
+
+func TestAlertService_FeishuAPIError_Logged(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"code":19021,"msg":"sign match fail"}`))
+	}))
+	defer srv.Close()
+
+	a := NewAlertService(srv.URL, "", nil, nil)
+	a.Send("ERROR", "Test", nil) // must not panic; error is logged internally
+}
+
+// TestAlertService_FeishuNonJSONBody_ParseErrorLogged 验证服务器返回 200 但 body 不是
+// JSON 时，sendFeishu 记录解析错误（不 panic）。这覆盖了签名后 json.Decode 失败路径。
+func TestAlertService_FeishuNonJSONBody_ParseErrorLogged(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("not-json"))
+	}))
+	defer srv.Close()
+
+	a := NewAlertService(srv.URL, "", nil, nil)
+	a.Send("ERROR", "Test", nil) // must not panic
+}
+
 func TestAlertService_EmailFanoutNonBlocking(t *testing.T) {
 	emailer := &captureEmailer{}
-	a := NewAlertService("", []string{"a@x.com", "b@x.com"}, emailer)
+	a := NewAlertService("", "", []string{"a@x.com", "b@x.com"}, emailer)
 	a.Send("INFO", "Test", map[string]string{"k": "v"})
 	if len(emailer.calls) != 2 {
 		t.Errorf("expected 2 email calls, got %d", len(emailer.calls))
@@ -133,7 +244,7 @@ func TestAlertService_EmailFanoutNonBlocking(t *testing.T) {
 
 func TestAlertService_EmailFailureSwallowed(t *testing.T) {
 	emailer := &captureEmailer{fail: true}
-	a := NewAlertService("", []string{"a@x.com"}, emailer)
+	a := NewAlertService("", "", []string{"a@x.com"}, emailer)
 	a.Send("INFO", "Test", nil) // must not panic / return error
 	if len(emailer.calls) != 1 {
 		t.Errorf("expected 1 email call even when it fails, got %d", len(emailer.calls))
@@ -145,12 +256,12 @@ func TestAlertService_FeishuFailureSwallowed(t *testing.T) {
 		w.WriteHeader(http.StatusServiceUnavailable)
 	}))
 	defer srv.Close()
-	a := NewAlertService(srv.URL, nil, nil)
+	a := NewAlertService(srv.URL, "", nil, nil)
 	a.Send("INFO", "Test", nil) // must not error
 }
 
 func TestAlertService_EmptyFeishuURL_NoCall(t *testing.T) {
-	a := NewAlertService("", nil, nil)
+	a := NewAlertService("", "", nil, nil)
 	a.Send("INFO", "Test", nil) // no panic on nil-everything
 }
 
@@ -169,7 +280,7 @@ func TestAlertService_FeishuRespectsCtxDeadline(t *testing.T) {
 	defer srv.Close()
 	defer close(released)
 
-	a := NewAlertService(srv.URL, nil, nil)
+	a := NewAlertService(srv.URL, "", nil, nil)
 	a.httpClient = &http.Client{Timeout: 5 * time.Second}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
@@ -190,7 +301,7 @@ func TestAlertService_FeishuRespectsCtxDeadline(t *testing.T) {
 // Regression: T7-I-6.
 func TestAlertService_EmailSubjectIncludesTitle(t *testing.T) {
 	emailer := &captureEmailer{}
-	a := NewAlertService("", []string{"ops@x.com"}, emailer)
+	a := NewAlertService("", "", []string{"ops@x.com"}, emailer)
 	a.Send("ERROR", "Deposit manual review", map[string]string{"reason": "ADDRESS_UNASSIGNED"})
 
 	if len(emailer.calls) != 1 {

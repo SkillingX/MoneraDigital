@@ -3,11 +3,16 @@ package alert
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -16,10 +21,11 @@ import (
 // Feishu webhook + an optional email distribution list. Both sinks are
 // best-effort: a failure on either is logged but does not propagate.
 type AlertService struct {
-	feishuURL  string
-	recipients []string
-	emailSvc   alertEmailer
-	httpClient *http.Client
+	feishuURL    string
+	feishuSecret string // signing secret; empty = no signature
+	recipients   []string
+	emailSvc     alertEmailer
+	httpClient   *http.Client
 }
 
 // alertEmailer is the narrow EmailService surface used here so the AlertService
@@ -32,12 +38,15 @@ type alertEmailer interface {
 }
 
 // NewAlertService configures a Feishu+email alert dispatcher.
-func NewAlertService(feishuURL string, recipients []string, email alertEmailer) *AlertService {
+// feishuSecret is the Signing Secret from the Lark bot security settings;
+// leave empty to send unsigned (works only when bot signing is disabled).
+func NewAlertService(feishuURL, feishuSecret string, recipients []string, email alertEmailer) *AlertService {
 	return &AlertService{
-		feishuURL:  feishuURL,
-		recipients: recipients,
-		emailSvc:   email,
-		httpClient: &http.Client{Timeout: 5 * time.Second},
+		feishuURL:    feishuURL,
+		feishuSecret: feishuSecret,
+		recipients:   recipients,
+		emailSvc:     email,
+		httpClient:   &http.Client{Timeout: 5 * time.Second},
 	}
 }
 
@@ -59,10 +68,21 @@ func (a *AlertService) sendFeishu(ctx context.Context, msg string) {
 	if a.feishuURL == "" {
 		return
 	}
-	body, err := json.Marshal(map[string]any{
+
+	payload := map[string]any{
 		"msg_type": "text",
 		"content":  map[string]string{"text": msg},
-	})
+	}
+	if a.feishuSecret != "" {
+		// Lark signing: HMAC-SHA256(key=timestamp+"\n"+secret, message="")
+		// https://open.larksuite.com/document/server-docs/bot-v3/add-custom-bot
+		timestamp := strconv.FormatInt(time.Now().Unix(), 10)
+		mac := hmac.New(sha256.New, []byte(timestamp+"\n"+a.feishuSecret))
+		payload["timestamp"] = timestamp
+		payload["sign"] = base64.StdEncoding.EncodeToString(mac.Sum(nil))
+	}
+
+	body, err := json.Marshal(payload)
 	if err != nil {
 		log.Printf("alert: feishu marshal failed: %v", err)
 		return
@@ -80,7 +100,19 @@ func (a *AlertService) sendFeishu(ctx context.Context, msg string) {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 400 {
-		log.Printf("alert: feishu non-2xx status: %d", resp.StatusCode)
+		log.Printf("alert: feishu http error status=%d", resp.StatusCode)
+		return
+	}
+	var result struct {
+		Code int    `json:"code"`
+		Msg  string `json:"msg"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 4096)).Decode(&result); err != nil {
+		log.Printf("alert: feishu response parse failed: %v", err)
+		return
+	}
+	if result.Code != 0 {
+		log.Printf("alert: feishu error code=%d msg=%s", result.Code, result.Msg)
 	}
 }
 

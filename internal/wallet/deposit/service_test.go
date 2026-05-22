@@ -1425,3 +1425,181 @@ func TestProcessOne_BelowMinAmount_FindDepositError(t *testing.T) {
 		t.Errorf("expected error to contain 'check existing deposit', got: %v", err)
 	}
 }
+
+// === 本次变更补充测试 ===
+
+// TestProcessOne_AddressUnassigned_AssetFieldPopulated 验证地址未分配时 deposits.asset
+// 字段仍正确写入 coin symbol（修复前该字段为空字符串）。
+func TestProcessOne_AddressUnassigned_AssetFieldPopulated(t *testing.T) {
+	repo := newMockRepo()
+	// 不设置 owner → LookupAddressOwner 返回 not found
+	reg := newTestRegistry("ETH", "ETHEREUM", "ETH", "0.0001", 7)
+	svc := newSvc(t, repo, reg, nil)
+
+	enqueueRaw(t, repo, PayloadEnvelope{
+		EventType: "TRANSACTION_CREATED",
+		EventDetail: PayloadEventDetail{
+			TxKey:                "tx-unassigned",
+			CoinKey:              "ETH",
+			TxAmount:             "0.05",
+			TransactionStatus:    "COMPLETED",
+			TransactionSubStatus: "CONFIRMED",
+			TransactionDirection: "INFLOW",
+			DestinationAddress:   "0xunknown",
+		},
+	})
+	if _, err := svc.ProcessOne(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	dep, ok := repo.deposits["tx-unassigned"]
+	if !ok {
+		t.Fatal("expected deposit row to be written")
+	}
+	if dep.Asset != "ETH" {
+		t.Errorf("expected Asset=ETH, got %q (symbol must be populated even when address unassigned)", dep.Asset)
+	}
+	if dep.Status != DepositStatusManualReview {
+		t.Errorf("expected status MANUAL_REVIEW, got %s", dep.Status)
+	}
+}
+
+// TestProcessOne_AddressUnassigned_TwoEvents_SingleAlert 验证同一未分配地址充值收到两
+// 条事件时，第二条不重复告警（alreadyFlagged 路径）。
+func TestProcessOne_AddressUnassigned_TwoEvents_SingleAlert(t *testing.T) {
+	repo := newMockRepo()
+	reg := newTestRegistry("ETH", "ETHEREUM", "ETH", "0.0001", 7)
+	alertFn, alerts := newAlertCollector()
+	svc := newSvc(t, repo, reg, alertFn)
+
+	detail := PayloadEventDetail{
+		TxKey:                "tx-dup-unassigned",
+		CoinKey:              "ETH",
+		TxAmount:             "0.05",
+		TransactionDirection: "INFLOW",
+		DestinationAddress:   "0xunknown",
+	}
+
+	// 第一条：CONFIRMING
+	detail.TransactionStatus = "CONFIRMING"
+	enqueueRaw(t, repo, PayloadEnvelope{EventType: "TRANSACTION_CREATED", EventDetail: detail})
+	if _, err := svc.ProcessOne(context.Background()); err != nil {
+		t.Fatalf("event 1: %v", err)
+	}
+
+	// 第二条：COMPLETED（同笔，deposit 已是 MANUAL_REVIEW）
+	detail.TransactionStatus = "COMPLETED"
+	detail.TransactionSubStatus = "CONFIRMED"
+	enqueueRaw(t, repo, PayloadEnvelope{EventType: "TRANSACTION_STATUS_CHANGED", EventDetail: detail})
+	if _, err := svc.ProcessOne(context.Background()); err != nil {
+		t.Fatalf("event 2: %v", err)
+	}
+
+	if len(*alerts) != 1 {
+		t.Errorf("expected exactly 1 alert for 2 events on same unassigned deposit, got %d", len(*alerts))
+	}
+	// 两条事件操作同一笔 deposit（同 ID），manualUpdates map 只有一个键
+	if len(repo.manualUpdates) != 1 {
+		t.Errorf("expected 1 deposit in manualUpdates (same deposit, two events), got %d", len(repo.manualUpdates))
+	}
+}
+
+// TestProcessOne_MarkMRNonTerminalError_Propagated 验证 MarkDepositManualReview 返回
+// 非 ErrDepositTerminalState 错误时，flagManualReview 将其包装后上浮（不静默吞掉）。
+func TestProcessOne_MarkMRNonTerminalError_Propagated(t *testing.T) {
+	repo := newMockRepo()
+	repo.markMRErr = errors.New("constraint violation")
+	reg := newTestRegistry("ETH", "ETHEREUM", "ETH", "0.0001", 7)
+	svc := newSvc(t, repo, reg, nil)
+
+	enqueueRaw(t, repo, PayloadEnvelope{
+		EventType: "TRANSACTION_CREATED",
+		EventDetail: PayloadEventDetail{
+			TxKey:                "tx-mr-err",
+			CoinKey:              "ETH",
+			TxAmount:             "0.05",
+			TransactionDirection: "INFLOW",
+			TransactionStatus:    "COMPLETED",
+			DestinationAddress:   "0xunknown",
+		},
+	})
+	_, err := svc.ProcessOne(context.Background())
+	if err == nil {
+		t.Fatal("expected error when MarkDepositManualReview fails with non-terminal error")
+	}
+	if !strings.Contains(err.Error(), "mark manual_review") {
+		t.Errorf("expected 'mark manual_review' in error, got: %v", err)
+	}
+	// flagAndFinalize calls MarkEventError when procErr != nil
+	if len(repo.errorIDs) != 1 {
+		t.Errorf("expected MarkEventError called once, got %d", len(repo.errorIDs))
+	}
+}
+
+// TestProcessOne_AddressUnassigned_AlertUserIDIsNA 验证地址未分配时告警字段
+// userId 为 "N/A" 而非 "0"，避免运维误读为系统账户（S-3）。
+func TestProcessOne_AddressUnassigned_AlertUserIDIsNA(t *testing.T) {
+	repo := newMockRepo()
+	reg := newTestRegistry("ETH", "ETHEREUM", "ETH", "0.0001", 7)
+	alertFn, alerts := newAlertCollector()
+	svc := newSvc(t, repo, reg, alertFn)
+
+	enqueueRaw(t, repo, PayloadEnvelope{
+		EventType: "TRANSACTION_CREATED",
+		EventDetail: PayloadEventDetail{
+			TxKey:                "tx-na-userid",
+			CoinKey:              "ETH",
+			TxAmount:             "0.05",
+			TransactionDirection: "INFLOW",
+			TransactionStatus:    "COMPLETED",
+			DestinationAddress:   "0xunknown",
+		},
+	})
+	if _, err := svc.ProcessOne(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(*alerts) != 1 {
+		t.Fatalf("expected 1 alert, got %d", len(*alerts))
+	}
+	got := (*alerts)[0].fields["userId"]
+	if got != "N/A" {
+		t.Errorf("expected userId=N/A for unassigned address, got %q", got)
+	}
+}
+
+// TestWarnIfTerminalState_TerminalError_Absorbed 验证传入 ErrDepositTerminalState 时
+// 函数返回 nil（告警日志但不冒泡）。
+func TestWarnIfTerminalState_TerminalError_Absorbed(t *testing.T) {
+	err := warnIfTerminalState(ErrDepositTerminalState, 42, "MANUAL_REVIEW")
+	if err != nil {
+		t.Errorf("expected nil when ErrDepositTerminalState is passed, got %v", err)
+	}
+}
+
+// TestWarnIfTerminalState_OtherError_Propagated 验证非终态错误原样返回。
+func TestWarnIfTerminalState_OtherError_Propagated(t *testing.T) {
+	sentinel := errors.New("db connection lost")
+	err := warnIfTerminalState(sentinel, 42, "MANUAL_REVIEW")
+	if !errors.Is(err, sentinel) {
+		t.Errorf("expected sentinel error to propagate, got %v", err)
+	}
+}
+
+// TestScanAmlPending_BeginTxError_Logged 验证 scanOneAmlPending 内部 BeginTx 失败时
+// ScanAmlPending 记录错误日志（不 panic）。
+func TestScanAmlPending_BeginTxError_Logged(t *testing.T) {
+	repo := newMockRepo()
+	repo.beginTxErr = errors.New("db unavailable")
+	svc := newSvc(t, repo, nil, nil)
+	svc.ScanAmlPending(context.Background()) // must not panic
+}
+
+// TestSetAMLFirstPollDelay_Negative_DefaultsToFiveMinutes 验证传入负值时使用默认 5m。
+func TestSetAMLFirstPollDelay_Negative_DefaultsToFiveMinutes(t *testing.T) {
+	repo := newMockRepo()
+	svc := NewService(repo, nil, nil)
+	svc.SetAMLFirstPollDelay(-1)
+	if svc.amlFirstPollDelay != 5*time.Minute {
+		t.Errorf("expected 5m, got %v", svc.amlFirstPollDelay)
+	}
+}

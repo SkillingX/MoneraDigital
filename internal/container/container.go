@@ -130,8 +130,9 @@ func WithSafeheronPool(ctx context.Context) ContainerOption {
 
 		// Alert sink (Feishu webhook + email recipients).
 		feishuURL := viper.GetString("ALERT_WEBHOOK_URL")
+		feishuSecret := viper.GetString("ALERT_WEBHOOK_SIGN_SECRET")
 		recipients := splitNonEmpty(viper.GetString("ALERT_EMAIL_RECIPIENTS"))
-		c.AlertService = alert.NewAlertService(feishuURL, recipients, c.EmailService)
+		c.AlertService = alert.NewAlertService(feishuURL, feishuSecret, recipients, c.EmailService)
 		c.PoolManager.SetAlertFunc(func(level, title, message string) {
 			c.AlertService.Send(level, title, map[string]string{"message": message})
 		})
