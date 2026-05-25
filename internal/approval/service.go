@@ -59,6 +59,7 @@ func (s *ApprovalService) Evaluate(ctx context.Context, biz *safeheron.CoSignerB
 		Reason:       decision.Reason,
 		ChainSymbol:  chainSymbol,
 		RawRequest:   rawBytes,
+		AmlRiskLevel: decision.AmlRiskLevel, // v1.1: AUTO_SWEEP/UTXO_COLLECTION 才有值，其他为 ""（落 NULL）
 	}
 
 	if hasDetail {
@@ -143,8 +144,9 @@ func (s *ApprovalService) handleIdempotent(ctx context.Context, approvalID strin
 	}
 	log.Printf("[approval] idempotent hit for approvalId=%s, returning previous action=%s", approvalID, existing.Action)
 	return &ApprovalDecision{
-		Action: existing.Action,
-		Reason: existing.Reason,
+		Action:       existing.Action,
+		Reason:       existing.Reason,
+		AmlRiskLevel: existing.AmlRiskLevel,
 	}, nil
 }
 
@@ -177,5 +179,12 @@ func (s *ApprovalService) sendRejectAlert(biz *safeheron.CoSignerBizContentV3, d
 	if sourceAddress != "" {
 		fields["sourceAddress"] = sourceAddress
 	}
-	s.alertFn("ERROR", "审批回调 REJECT", fields)
+	// v1.1 Phase 1 (D-AML-7)：AML 路径触发的 REJECT 一律 WARN（不分等级）；
+	// 非 AML 路径（白名单失败 / 非 VAULT_ACCOUNT 等）保持 ERROR。
+	level := "ERROR"
+	if decision.AmlRiskLevel != "" {
+		level = "WARN"
+		fields["riskLevel"] = decision.AmlRiskLevel
+	}
+	s.alertFn(level, "审批回调 REJECT", fields)
 }

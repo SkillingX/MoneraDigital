@@ -36,16 +36,25 @@ func newTestConfig() ApprovalConfig {
 }
 
 func makeBiz(txType, destType, destKey string) *safeheron.CoSignerBizContentV3 {
+	// v1.1: 默认带 TRIGGERED + LOW AML 字段，使原有 APPROVE 路径继续通过。
+	// 测试 AML 拒绝路径时用 makeBizWithAML。
+	return makeBizWithAML(txType, destType, destKey, "TRIGGERED",
+		json.RawMessage(`[{"provider":"MistTrack","status":"COMPLETED","riskLevel":"LOW"}]`))
+}
+
+func makeBizWithAML(txType, destType, destKey, amlState string, amlList json.RawMessage) *safeheron.CoSignerBizContentV3 {
 	detail := safeheron.TransactionApproval{
-		TxKey:                  "tx-1",
-		CoinKey:                "USDT_ERC20",
-		TxAmount:               "100",
-		TransactionType:        txType,
-		DestinationAccountKey:  destKey,
-		DestinationAccountType: destType,
-		DestinationAddress:     "0xabc",
-		SourceAccountKey:       "src-1",
-		SourceAddress:          "0xdef",
+		TxKey:                      "tx-1",
+		CoinKey:                    "USDT_ERC20",
+		TxAmount:                   "100",
+		TransactionType:            txType,
+		DestinationAccountKey:      destKey,
+		DestinationAccountType:     destType,
+		DestinationAddress:         "0xabc",
+		SourceAccountKey:           "src-1",
+		SourceAddress:              "0xdef",
+		AmlScreeningTriggeredState: amlState,
+		AmlList:                    amlList,
 	}
 	data, _ := json.Marshal(detail)
 	return &safeheron.CoSignerBizContentV3{
@@ -332,5 +341,136 @@ func TestResolveChainSymbol_NilChain(t *testing.T) {
 	got := a.ResolveChainSymbol("BAD")
 	if got != "UNKNOWN" {
 		t.Errorf("ResolveChainSymbol(BAD) = %q, want UNKNOWN", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// v1.1 Phase 1: AML 校验集成（spec §13.6）
+// ---------------------------------------------------------------------------
+
+func TestAutoSweep_AML_Low_Approves(t *testing.T) {
+	a := NewTransactionApprover(newTestConfig(), newTestRegistry())
+	biz := makeBizWithAML("AUTO_SWEEP", "VAULT_ACCOUNT", "acct-main", "TRIGGERED",
+		json.RawMessage(`[{"status":"COMPLETED","riskLevel":"LOW"}]`))
+	dec, err := a.Evaluate(context.Background(), biz)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if dec.Action != "APPROVE" {
+		t.Errorf("action = %q, want APPROVE; reason=%q", dec.Action, dec.Reason)
+	}
+	if dec.AmlRiskLevel != "LOW" {
+		t.Errorf("amlRiskLevel = %q, want LOW", dec.AmlRiskLevel)
+	}
+}
+
+func TestAutoSweep_AML_High_Rejects(t *testing.T) {
+	a := NewTransactionApprover(newTestConfig(), newTestRegistry())
+	biz := makeBizWithAML("AUTO_SWEEP", "VAULT_ACCOUNT", "acct-main", "TRIGGERED",
+		json.RawMessage(`[{"status":"COMPLETED","riskLevel":"HIGH"}]`))
+	dec, _ := a.Evaluate(context.Background(), biz)
+	if dec.Action != "REJECT" {
+		t.Errorf("action = %q, want REJECT", dec.Action)
+	}
+	if dec.AmlRiskLevel != "HIGH" {
+		t.Errorf("amlRiskLevel = %q, want HIGH", dec.AmlRiskLevel)
+	}
+	if !strings.Contains(dec.Reason, "SWEEP_AML_RISK_HIGH") {
+		t.Errorf("reason should contain SWEEP_AML_RISK_HIGH, got %q", dec.Reason)
+	}
+}
+
+func TestAutoSweep_AML_Medium_Rejects(t *testing.T) {
+	a := NewTransactionApprover(newTestConfig(), newTestRegistry())
+	biz := makeBizWithAML("AUTO_SWEEP", "VAULT_ACCOUNT", "acct-main", "TRIGGERED",
+		json.RawMessage(`[{"status":"COMPLETED","riskLevel":"MEDIUM"}]`))
+	dec, _ := a.Evaluate(context.Background(), biz)
+	if dec.Action != "REJECT" {
+		t.Errorf("action = %q, want REJECT", dec.Action)
+	}
+	if dec.AmlRiskLevel != "MEDIUM" {
+		t.Errorf("amlRiskLevel = %q, want MEDIUM", dec.AmlRiskLevel)
+	}
+}
+
+func TestAutoSweep_AML_Untriggered_Rejects(t *testing.T) {
+	a := NewTransactionApprover(newTestConfig(), newTestRegistry())
+	biz := makeBizWithAML("AUTO_SWEEP", "VAULT_ACCOUNT", "acct-main", "UNTRIGGERED", nil)
+	dec, _ := a.Evaluate(context.Background(), biz)
+	if dec.Action != "REJECT" {
+		t.Errorf("action = %q, want REJECT", dec.Action)
+	}
+	if dec.AmlRiskLevel != "STATE_UNTRIGGERED" {
+		t.Errorf("amlRiskLevel = %q, want STATE_UNTRIGGERED", dec.AmlRiskLevel)
+	}
+}
+
+func TestAutoSweep_AML_StateMissing_Rejects(t *testing.T) {
+	a := NewTransactionApprover(newTestConfig(), newTestRegistry())
+	biz := makeBizWithAML("AUTO_SWEEP", "VAULT_ACCOUNT", "acct-main", "", nil)
+	dec, _ := a.Evaluate(context.Background(), biz)
+	if dec.Action != "REJECT" {
+		t.Errorf("action = %q, want REJECT", dec.Action)
+	}
+	if dec.AmlRiskLevel != "STATE_MISSING" {
+		t.Errorf("amlRiskLevel = %q, want STATE_MISSING", dec.AmlRiskLevel)
+	}
+}
+
+func TestAutoSweep_WhitelistFailsBeforeAML(t *testing.T) {
+	// 白名单失败先于 AML 校验拦截：即使 AML=LOW，未命中白名单依然 REJECT，
+	// 且 AmlRiskLevel 不被填写（因为 AML 步骤未执行）。
+	a := NewTransactionApprover(newTestConfig(), newTestRegistry())
+	biz := makeBizWithAML("AUTO_SWEEP", "VAULT_ACCOUNT", "unknown-acct", "TRIGGERED",
+		json.RawMessage(`[{"status":"COMPLETED","riskLevel":"LOW"}]`))
+	dec, _ := a.Evaluate(context.Background(), biz)
+	if dec.Action != "REJECT" {
+		t.Errorf("action = %q, want REJECT", dec.Action)
+	}
+	if dec.AmlRiskLevel != "" {
+		t.Errorf("amlRiskLevel = %q, want empty (AML 未执行)", dec.AmlRiskLevel)
+	}
+	if !strings.Contains(dec.Reason, "not in whitelist") {
+		t.Errorf("reason should mention whitelist, got %q", dec.Reason)
+	}
+}
+
+func TestUtxoCollection_AML_High_Rejects(t *testing.T) {
+	a := NewTransactionApprover(newTestConfig(), newTestRegistry())
+	biz := makeBizWithAML("UTXO_COLLECTION", "VAULT_ACCOUNT", "acct-main", "TRIGGERED",
+		json.RawMessage(`[{"status":"COMPLETED","riskLevel":"HIGH"}]`))
+	dec, _ := a.Evaluate(context.Background(), biz)
+	if dec.Action != "REJECT" {
+		t.Errorf("action = %q, want REJECT", dec.Action)
+	}
+	if dec.AmlRiskLevel != "HIGH" {
+		t.Errorf("amlRiskLevel = %q, want HIGH", dec.AmlRiskLevel)
+	}
+}
+
+func TestUtxoCollection_AML_Low_Approves(t *testing.T) {
+	a := NewTransactionApprover(newTestConfig(), newTestRegistry())
+	biz := makeBizWithAML("UTXO_COLLECTION", "VAULT_ACCOUNT", "acct-main", "TRIGGERED",
+		json.RawMessage(`[{"status":"COMPLETED","riskLevel":"LOW"}]`))
+	dec, _ := a.Evaluate(context.Background(), biz)
+	if dec.Action != "APPROVE" {
+		t.Errorf("action = %q, want APPROVE; reason=%q", dec.Action, dec.Reason)
+	}
+	if dec.AmlRiskLevel != "LOW" {
+		t.Errorf("amlRiskLevel = %q, want LOW", dec.AmlRiskLevel)
+	}
+}
+
+func TestAutoFuel_AML_High_StillApproves(t *testing.T) {
+	// D-AML-5: AUTO_FUEL 不走 AML 校验（gas 反向无风险），即使 HIGH 也 APPROVE。
+	a := NewTransactionApprover(newTestConfig(), newTestRegistry())
+	biz := makeBizWithAML("AUTO_FUEL", "VAULT_ACCOUNT", "acct-main", "TRIGGERED",
+		json.RawMessage(`[{"status":"COMPLETED","riskLevel":"HIGH"}]`))
+	dec, _ := a.Evaluate(context.Background(), biz)
+	if dec.Action != "APPROVE" {
+		t.Errorf("action = %q, want APPROVE (AUTO_FUEL 不走 AML); reason=%q", dec.Action, dec.Reason)
+	}
+	if dec.AmlRiskLevel != "" {
+		t.Errorf("amlRiskLevel = %q, want empty (AUTO_FUEL 不填)", dec.AmlRiskLevel)
 	}
 }

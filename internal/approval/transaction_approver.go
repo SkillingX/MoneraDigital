@@ -72,8 +72,21 @@ func (a *TransactionApprover) evaluateAutoSweep(detail *safeheron.TransactionApp
 			Reason: fmt.Sprintf("AUTO_SWEEP destination account %q not in whitelist", detail.DestinationAccountKey),
 		}, nil
 	}
-	// TODO: 金额校验待测试环境验证真实数据后补充 — spec §4.3
-	return &ApprovalDecision{Action: "APPROVE", Reason: "AUTO_SWEEP approved"}, nil
+	// v1.1 Phase 1：AML 校验（D-AML-3 fail closed）。
+	// 仅 TRIGGERED + LOW 放行，其余拒绝。详见 spec §13。
+	amlDecision := DecideSweepAML(detail.AmlScreeningTriggeredState, detail.AmlList)
+	if !amlDecision.Approve {
+		return &ApprovalDecision{
+			Action:       "REJECT",
+			Reason:       fmt.Sprintf("AUTO_SWEEP rejected: %s (risk=%s)", amlDecision.Reason, amlDecision.RiskLevel),
+			AmlRiskLevel: amlDecision.RiskLevel,
+		}, nil
+	}
+	return &ApprovalDecision{
+		Action:       "APPROVE",
+		Reason:       fmt.Sprintf("AUTO_SWEEP approved (AML=%s)", amlDecision.RiskLevel),
+		AmlRiskLevel: amlDecision.RiskLevel,
+	}, nil
 }
 
 func (a *TransactionApprover) evaluateAutoFuel(detail *safeheron.TransactionApproval) (*ApprovalDecision, error) {
@@ -106,7 +119,20 @@ func (a *TransactionApprover) evaluateUTXOCollection(detail *safeheron.Transacti
 			Reason: fmt.Sprintf("UTXO_COLLECTION destination account %q not in whitelist", detail.DestinationAccountKey),
 		}, nil
 	}
-	return &ApprovalDecision{Action: "APPROVE", Reason: "UTXO_COLLECTION approved"}, nil
+	// v1.1 Phase 1：AML 校验，与 AUTO_SWEEP 同策略。
+	amlDecision := DecideSweepAML(detail.AmlScreeningTriggeredState, detail.AmlList)
+	if !amlDecision.Approve {
+		return &ApprovalDecision{
+			Action:       "REJECT",
+			Reason:       fmt.Sprintf("UTXO_COLLECTION rejected: %s (risk=%s)", amlDecision.Reason, amlDecision.RiskLevel),
+			AmlRiskLevel: amlDecision.RiskLevel,
+		}, nil
+	}
+	return &ApprovalDecision{
+		Action:       "APPROVE",
+		Reason:       fmt.Sprintf("UTXO_COLLECTION approved (AML=%s)", amlDecision.RiskLevel),
+		AmlRiskLevel: amlDecision.RiskLevel,
+	}, nil
 }
 
 func (a *TransactionApprover) isTxTypeAllowed(txType string) bool {

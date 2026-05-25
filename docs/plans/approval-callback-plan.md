@@ -224,3 +224,214 @@ Task 1 (基础设施) → Task 2 (审批逻辑) → Task 3 (HTTP+组装) → Tas
 | 金额校验逻辑待定 | 低 | 预留扩展点 + TODO 注释，不阻塞本期交付 |
 | SDK CoSignerConfig 字段名误导 | 低 | spec §3.3 已注释说明，CosignerConfig 用清晰命名包装 |
 | 生产环境密钥未就绪 | 低 | Container option 降级处理（密钥缺失则跳过） |
+
+---
+
+# v1.1 Phase 1 实施计划（AML 硬封堵）
+
+> **关联 spec**: `docs/spec/approval-callback-spec.md` §13（D-AML-1..12 决策已闭环）
+> **日期**: 2026-05-25
+> **范围**: 仅 Phase 1（仅 `TRIGGERED + LOW` APPROVE，其余全 REJECT）
+> **不在范围**: Phase 2（override 表 / admin API / 三元决策 / 告警分级），等主流程跑通 + §13.10 实测后启动
+
+2 个任务，串行执行，每个对应一个独立 commit。预计 1 天。
+
+```
+Task 1 (基础设施) ──► Task 2 (AML 接入 + 验收)
+```
+
+---
+
+## Task 1：基础设施 — SummarizeRiskLevel 上提 + Migration 024
+
+> **决策**: D-AML-10, D-AML-11
+> **目标**: 解耦 approval/deposit 模块共享 AML 等级聚合逻辑；在 approval_records 表加 aml_risk_level 列
+
+### 1.1 SummarizeRiskLevel 迁移到 safeheron 包
+
+**硬约束**: 零行为变更 — deposit 包内所有测试用例的**期望字符串值不变**，仅允许 import / 符号名替换。
+
+**迁移清单**（字符串值完全保持）:
+
+| 旧位置 | 新位置 |
+|--------|--------|
+| `deposit.SummarizeRiskLevel(amlList)` | `safeheron.SummarizeAmlRiskLevel(amlList []AmlReport) string` |
+| `deposit.riskSeverity` 私有 | `safeheron.amlRiskSeverity` 私有 |
+| `deposit.KytLow`/`KytMedium`/`KytHigh`/`KytSevere`/`KytUnknown`/`KytFailed`/`KytSkipped`/`KytPending`/`KytEmpty` | `safeheron.AmlRiskLow` / ... / `safeheron.AmlRiskEmpty`（值不变，全部 `"LOW"`/`"MEDIUM"`/...） |
+
+**保留在 deposit 包**（不迁）: `KytActionCredit/KeepPending/ManualReview` 常量、`KytDecision` 类型、`DecideKYT` 函数、`ReasonKyt*` 常量、`AlertLevelForKyt` 函数。
+
+**改动文件**:
+- 新增：`internal/safeheron/aml.go`（函数 + 常量 + 私有 helper）
+- 新增：`internal/safeheron/aml_test.go`（把 `deposit/kyt_test.go::TestSummarizeRiskLevel` 整体搬来，改符号名）
+- 修改：`internal/wallet/deposit/kyt.go`（删迁出符号；DecideKYT 内部调用改 `safeheron.SummarizeAmlRiskLevel` + `safeheron.AmlRisk*`）
+- 修改：`internal/wallet/deposit/kyt_test.go`（`TestDecideKYT` 用例期望值符号名改 `safeheron.AmlRiskLow` 等）
+
+### 1.2 Migration 024 — approval_records 加 aml_risk_level 列
+
+**新增**: `internal/migration/migrations/024_add_aml_risk_level_to_approval_records.go`（参照 023 的 step struct 模式）
+
+**DDL**:
+```sql
+-- Up
+ALTER TABLE approval_records ADD COLUMN IF NOT EXISTS aml_risk_level VARCHAR(16);
+CREATE INDEX IF NOT EXISTS idx_approval_records_aml_risk ON approval_records(aml_risk_level);
+
+-- Down
+DROP INDEX IF EXISTS idx_approval_records_aml_risk;
+ALTER TABLE approval_records DROP COLUMN IF EXISTS aml_risk_level;
+```
+
+**修改**: `cmd/migrate/main.go` 注册 024；如有 migration step 测试，追加 024 条目。
+
+历史数据不回填，新列默认 NULL。
+
+### 1.3 验收
+
+```bash
+go build ./... && go vet ./...
+go test ./internal/wallet/deposit/... ./internal/safeheron/... ./internal/migration/... -race -count=1
+grep -rn "deposit\.\(SummarizeRiskLevel\|Kyt\(Low\|Medium\|High\|Severe\|Unknown\|Failed\|Skipped\|Pending\|Empty\)\)" internal/ \
+    || echo "OK: no remaining external references"
+```
+
+**Checkpoint**:
+- [ ] `safeheron/aml.go` 行覆盖 = 100%
+- [ ] deposit 包测试全绿，且 `git diff internal/wallet/deposit/` 仅符号名/import 改动，无期望字符串值变更
+- [ ] grep 输出 "OK: no remaining external references"
+- [ ] migration 二次执行幂等
+
+---
+
+## Task 2：AML 硬封堵接入 + 验收
+
+> **决策**: D-AML-1, D-AML-3, D-AML-5, D-AML-7, D-AML-11
+> **目标**: 把 AML 校验串入 AUTO_SWEEP / UTXO_COLLECTION 审批，结果落库 approval_records.aml_risk_level，REJECT 触发飞书告警
+
+### 2.1 DecideSweepAML（TDD）
+
+**新增**: `internal/approval/sweep_aml.go` + `sweep_aml_test.go`
+
+```go
+type SweepAMLDecision struct {
+    Approve   bool
+    RiskLevel string  // 写入 approval_records.aml_risk_level
+    Reason    string  // 写入 approval_records.reason
+}
+
+func DecideSweepAML(state string, amlListRaw json.RawMessage) SweepAMLDecision
+```
+
+**算法**:
+- `state != "TRIGGERED"` → REJECT，`RiskLevel = "STATE_<state或MISSING>"`，`Reason = "SWEEP_AML_STATE_<...>"`
+- `amlListRaw` 为空 / `"null"` → REJECT，`RiskLevel = "EMPTY"`，`Reason = "SWEEP_AML_RISK_EMPTY"`
+- `amlListRaw` 反序列化失败 → REJECT，`RiskLevel = "PARSE_FAILED"`，`Reason = "SWEEP_AML_PARSE_FAILED"`
+- `safeheron.SummarizeAmlRiskLevel(...) == AmlRiskLow` → APPROVE，`RiskLevel = "LOW"`，`Reason = "SWEEP_AML_OK"`
+- 其他 risk → REJECT，`RiskLevel = risk`，`Reason = "SWEEP_AML_RISK_<risk>"`
+
+**单测矩阵**（表格驱动 15 条子用例）: TRIGGERED × {LOW / MEDIUM / HIGH / SEVERE / UNKNOWN / PENDING / FAILED / SKIPPED / 空数组 / null / mixed-high / invalid-json} + {UNTRIGGERED / IN_PROGRESS / 空字符串}。每条断言 `Approve` + `RiskLevel` + `Reason` 三元组。
+
+### 2.2 ApprovalRecord / Repository / Approver / Service 串联
+
+**改 `internal/approval/approver.go`**: `ApprovalDecision` 加 `AmlRiskLevel string` 字段。
+
+**改 `internal/approval/models.go`**: `ApprovalRecord` 加 `AmlRiskLevel string ` 带 `json:"amlRiskLevel,omitempty" db:"aml_risk_level"`。
+
+**改 `internal/approval/repository.go`**: `InsertApprovalRecord` + `GetApprovalByID` 加 `aml_risk_level` 列；空字符串通过 `sql.NullString{Valid: false}` 落 NULL。
+
+**改 `internal/approval/transaction_approver.go`**: `evaluateAutoSweep` 和 `evaluateUTXOCollection` 在现有"VAULT_ACCOUNT + 白名单"校验后，追加：
+
+```go
+amlDecision := DecideSweepAML(detail.AmlScreeningTriggeredState, detail.AmlList)
+if !amlDecision.Approve {
+    return &ApprovalDecision{
+        Action:       "REJECT",
+        Reason:       fmt.Sprintf("AUTO_SWEEP rejected: %s (risk=%s)", amlDecision.Reason, amlDecision.RiskLevel),
+        AmlRiskLevel: amlDecision.RiskLevel,
+    }, nil
+}
+return &ApprovalDecision{
+    Action:       "APPROVE",
+    Reason:       fmt.Sprintf("AUTO_SWEEP approved (AML=%s)", amlDecision.RiskLevel),
+    AmlRiskLevel: amlDecision.RiskLevel,
+}, nil
+```
+
+`evaluateAutoFuel` **不改**（D-AML-5）。`AmlRiskLevel` 字段保持零值 `""`。
+
+**改 `internal/approval/service.go`**: 组装 ApprovalRecord 时 `record.AmlRiskLevel = decision.AmlRiskLevel`；REJECT 告警 fields 追加 `"riskLevel": decision.AmlRiskLevel`，告警级别一律 `WARN`（D-AML-7）。
+
+### 2.3 测试增量
+
+**`transaction_approver_test.go` 9 条新增**:
+
+| 场景 | tx_type | state | risk | 白名单 | 期望 Action | 期望 AmlRiskLevel |
+|------|---------|-------|------|-------|------|-------|
+| autosweep low approves | AUTO_SWEEP | TRIGGERED | LOW | ✓ | APPROVE | LOW |
+| autosweep high rejects | AUTO_SWEEP | TRIGGERED | HIGH | ✓ | REJECT | HIGH |
+| autosweep medium rejects | AUTO_SWEEP | TRIGGERED | MEDIUM | ✓ | REJECT | MEDIUM |
+| autosweep untriggered rejects | AUTO_SWEEP | UNTRIGGERED | — | ✓ | REJECT | STATE_UNTRIGGERED |
+| autosweep state missing rejects | AUTO_SWEEP | `""` | — | ✓ | REJECT | STATE_MISSING |
+| autosweep whitelist fail before aml | AUTO_SWEEP | TRIGGERED | LOW | ✗ | REJECT | `""` |
+| utxo high rejects | UTXO_COLLECTION | TRIGGERED | HIGH | ✓ | REJECT | HIGH |
+| utxo low approves | UTXO_COLLECTION | TRIGGERED | LOW | ✓ | APPROVE | LOW |
+| autofuel high approves | AUTO_FUEL | TRIGGERED | HIGH | ✓ | APPROVE | `""` |
+
+**`repository_test.go` 2 条**:
+- INSERT 含 aml_risk_level；空字符串落 NULL
+- SELECT 读 NULL 返回 ""
+
+**`service_test.go` 2 条**:
+- LOW → InsertApprovalRecord 参数 aml_risk_level="LOW"
+- HIGH → 同上 + alert hook 被调用一次，fields 含 `riskLevel="HIGH"` + level=`"WARN"`
+
+### 2.4 现有测试的预期回归（⚠️ 不是 bug）
+
+现有 `transaction_approver_test.go` 中 AUTO_SWEEP / UTXO_COLLECTION 的 APPROVE 用例多半没 mock AML 字段，改造后会变 REJECT。**修复方法**：在原 mock 输入补：
+
+```go
+AmlScreeningTriggeredState: "TRIGGERED",
+AmlList: json.RawMessage(`[{"provider":"MistTrack","status":"COMPLETED","riskLevel":"LOW"}]`),
+```
+
+REJECT 用例（白名单失败 / 非 VAULT_ACCOUNT）不需要改。
+
+### 2.5 验收（§13.13 Phase 1 全部 10 条）
+
+```bash
+go build ./cmd/server/ && go vet ./...
+go test ./... -race -count=1
+go test ./internal/safeheron/... ./internal/approval/... -coverprofile=cover.out
+go tool cover -func=cover.out | grep -E "aml\.go|sweep_aml\.go|transaction_approver\.go"
+```
+
+**Checkpoint**:
+- [ ] §13.13 Phase 1 验收 10 条全部对应测试通过
+- [ ] `safeheron/aml.go` = 100%，`approval/sweep_aml.go` = 100%，`approval/transaction_approver.go` ≥ 90%
+- [ ] 全量 `go test ./... -race` 不引入新失败（与 `monera_test_baseline_failures.md` 对照）
+- [ ] `go vet ./...` 无报错
+
+---
+
+## 决策反向索引
+
+施工对设计有疑问 → 反查 spec §13.1 的 D-AML-*：
+
+| 关联任务 | 决策 ID | 摘要 |
+|---------|--------|------|
+| Task 1 | D-AML-10 | SummarizeRiskLevel 上提到 safeheron |
+| Task 1, 2 | D-AML-11 | Phase 1 加 aml_risk_level 列 |
+| Task 2 | D-AML-1 | AML 数据源 = callback 字段 |
+| Task 2 | D-AML-3 | 非标准状态全 REJECT（fail closed） |
+| Task 2 | D-AML-5 | AUTO_FUEL 不改造 |
+| Task 2 | D-AML-7 | Phase 1 告警一律 WARN |
+| Phase 2 | D-AML-2 / 4 / 6 / 8 / 9 / 12 | override 表 / admin API / 节奏 / schema 扩展 / 鉴权 / bypass — **不在 Phase 1**
+
+## 风险
+
+| 风险 | 概率 | 缓解 |
+|------|------|------|
+| Task 1 迁移漏改某调用点导致 vet 红 | 低 | 1.3 节 grep 检查；编译期可发现 |
+| Task 2 现有 APPROVE 测试集体变红 | 高 | 预期；按 2.4 节补 mock |
+| 全量 race 出现 data race | 低 | 无新增 goroutine |
+| Phase 1 上线后地址池资金积压 | 中 | 部署前确认 Safeheron 归集策略可暂停；spec §13.11 已记录 |

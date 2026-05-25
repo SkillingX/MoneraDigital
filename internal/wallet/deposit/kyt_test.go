@@ -7,41 +7,7 @@ import (
 	"monera-digital/internal/safeheron"
 )
 
-func TestSummarizeRiskLevel(t *testing.T) {
-	tests := []struct {
-		name     string
-		amlList  []safeheron.AmlReport
-		expected string
-	}{
-		{"COMPLETED LOW", []safeheron.AmlReport{{Status: "COMPLETED", RiskLevel: "LOW"}}, KytLow},
-		{"COMPLETED MEDIUM", []safeheron.AmlReport{{Status: "COMPLETED", RiskLevel: "MEDIUM"}}, KytMedium},
-		{"COMPLETED HIGH", []safeheron.AmlReport{{Status: "COMPLETED", RiskLevel: "HIGH"}}, KytHigh},
-		{"COMPLETED SEVERE", []safeheron.AmlReport{{Status: "COMPLETED", RiskLevel: "SEVERE"}}, KytSevere},
-		{"COMPLETED UNKNOWN", []safeheron.AmlReport{{Status: "COMPLETED", RiskLevel: "UNKNOWN"}}, KytUnknown},
-		{"PENDING status", []safeheron.AmlReport{{Status: "PENDING", RiskLevel: ""}}, KytPending},
-		{"FAILED status", []safeheron.AmlReport{{Status: "FAILED", RiskLevel: ""}}, KytFailed},
-		{"SKIPPED status", []safeheron.AmlReport{{Status: "SKIPPED", RiskLevel: ""}}, KytSkipped},
-		{"PENDING beats FAILED", []safeheron.AmlReport{
-			{Status: "FAILED", RiskLevel: ""},
-			{Status: "PENDING", RiskLevel: ""},
-		}, KytPending},
-		{"multi COMPLETED takes highest", []safeheron.AmlReport{
-			{Status: "COMPLETED", RiskLevel: "LOW"},
-			{Status: "COMPLETED", RiskLevel: "HIGH"},
-			{Status: "COMPLETED", RiskLevel: "MEDIUM"},
-		}, KytHigh},
-		{"empty list returns EMPTY sentinel", []safeheron.AmlReport{}, KytEmpty},
-		{"nil list returns EMPTY sentinel", nil, KytEmpty},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := SummarizeRiskLevel(tt.amlList)
-			if got != tt.expected {
-				t.Errorf("SummarizeRiskLevel() = %q, want %q", got, tt.expected)
-			}
-		})
-	}
-}
+// TestSummarizeRiskLevel 已迁移到 internal/safeheron/aml_test.go::TestSummarizeAmlRiskLevel (v1.1 §13.5.1)
 
 func TestDecideKYT(t *testing.T) {
 	low := []safeheron.AmlReport{{Status: "COMPLETED", RiskLevel: "LOW"}}
@@ -64,36 +30,36 @@ func TestDecideKYT(t *testing.T) {
 		wantAlert      string
 	}{
 		// 初查路径
-		{"IN_PROGRESS", "IN_PROGRESS", nil, false, KytActionKeepPending, KytPending, "", ""},
-		{"UNTRIGGERED", "UNTRIGGERED", nil, false, KytActionManualReview, KytUnknown, ReasonKytUntriggered, "WARN"},
-		{"TRIGGERED LOW", "TRIGGERED", low, false, KytActionCredit, KytLow, "", ""},
-		{"TRIGGERED HIGH", "TRIGGERED", high, false, KytActionManualReview, KytHigh, "KYT_RISK_HIGH", "ERROR"},
-		{"TRIGGERED SEVERE", "TRIGGERED", severe, false, KytActionManualReview, KytSevere, "KYT_RISK_SEVERE", "ERROR"},
-		{"TRIGGERED MEDIUM", "TRIGGERED", medium, false, KytActionManualReview, KytMedium, "KYT_RISK_MEDIUM", "WARN"},
-		{"TRIGGERED UNKNOWN", "TRIGGERED", unknown, false, KytActionManualReview, KytUnknown, "KYT_RISK_UNKNOWN", "WARN"},
-		{"TRIGGERED PENDING", "TRIGGERED", pending, false, KytActionKeepPending, KytPending, "", ""},
-		{"TRIGGERED FAILED", "TRIGGERED", failed, false, KytActionManualReview, KytFailed, ReasonKytProviderFailed, "WARN"},
-		{"TRIGGERED SKIPPED", "TRIGGERED", skipped, false, KytActionManualReview, KytSkipped, ReasonKytSkipped, "WARN"},
+		{"IN_PROGRESS", "IN_PROGRESS", nil, false, KytActionKeepPending, safeheron.AmlRiskPending, "", ""},
+		{"UNTRIGGERED", "UNTRIGGERED", nil, false, KytActionManualReview, safeheron.AmlRiskUnknown, ReasonKytUntriggered, "WARN"},
+		{"TRIGGERED LOW", "TRIGGERED", low, false, KytActionCredit, safeheron.AmlRiskLow, "", ""},
+		{"TRIGGERED HIGH", "TRIGGERED", high, false, KytActionManualReview, safeheron.AmlRiskHigh, "KYT_RISK_HIGH", "ERROR"},
+		{"TRIGGERED SEVERE", "TRIGGERED", severe, false, KytActionManualReview, safeheron.AmlRiskSevere, "KYT_RISK_SEVERE", "ERROR"},
+		{"TRIGGERED MEDIUM", "TRIGGERED", medium, false, KytActionManualReview, safeheron.AmlRiskMedium, "KYT_RISK_MEDIUM", "WARN"},
+		{"TRIGGERED UNKNOWN", "TRIGGERED", unknown, false, KytActionManualReview, safeheron.AmlRiskUnknown, "KYT_RISK_UNKNOWN", "WARN"},
+		{"TRIGGERED PENDING", "TRIGGERED", pending, false, KytActionKeepPending, safeheron.AmlRiskPending, "", ""},
+		{"TRIGGERED FAILED", "TRIGGERED", failed, false, KytActionManualReview, safeheron.AmlRiskFailed, ReasonKytProviderFailed, "WARN"},
+		{"TRIGGERED SKIPPED", "TRIGGERED", skipped, false, KytActionManualReview, safeheron.AmlRiskSkipped, ReasonKytSkipped, "WARN"},
 
 		// I-2: TRIGGERED + empty amlList → ManualReview (not silent credit)
-		{"TRIGGERED empty list", "TRIGGERED", nil, false, KytActionManualReview, KytEmpty, ReasonKytEmptyAmlList, "WARN"},
-		{"TRIGGERED empty list timeout", "TRIGGERED", []safeheron.AmlReport{}, true, KytActionManualReview, KytEmpty, ReasonKytEmptyAmlList, "WARN"},
+		{"TRIGGERED empty list", "TRIGGERED", nil, false, KytActionManualReview, safeheron.AmlRiskEmpty, ReasonKytEmptyAmlList, "WARN"},
+		{"TRIGGERED empty list timeout", "TRIGGERED", []safeheron.AmlReport{}, true, KytActionManualReview, safeheron.AmlRiskEmpty, ReasonKytEmptyAmlList, "WARN"},
 
 		// S-3: unknown state → ManualReview
-		{"unknown state", "BANANA", nil, false, KytActionManualReview, KytUnknown, ReasonKytUnknownState, "ERROR"},
-		{"empty state", "", nil, false, KytActionManualReview, KytUnknown, ReasonKytUnknownState, "ERROR"},
+		{"unknown state", "BANANA", nil, false, KytActionManualReview, safeheron.AmlRiskUnknown, ReasonKytUnknownState, "ERROR"},
+		{"empty state", "", nil, false, KytActionManualReview, safeheron.AmlRiskUnknown, ReasonKytUnknownState, "ERROR"},
 
 		// 超时兜底路径
-		{"IN_PROGRESS timeout", "IN_PROGRESS", nil, true, KytActionManualReview, KytPending, ReasonKytTimeoutStillPending, "ERROR"},
-		{"UNTRIGGERED timeout", "UNTRIGGERED", nil, true, KytActionManualReview, KytUnknown, ReasonKytUntriggeredAfterTimeout, "WARN"},
-		{"TRIGGERED LOW timeout", "TRIGGERED", low, true, KytActionCredit, KytLow, "", ""},
-		{"TRIGGERED HIGH timeout", "TRIGGERED", high, true, KytActionManualReview, KytHigh, "KYT_RISK_HIGH_AFTER_TIMEOUT", "ERROR"},
-		{"TRIGGERED SEVERE timeout", "TRIGGERED", severe, true, KytActionManualReview, KytSevere, "KYT_RISK_SEVERE_AFTER_TIMEOUT", "ERROR"},
-		{"TRIGGERED MEDIUM timeout", "TRIGGERED", medium, true, KytActionManualReview, KytMedium, "KYT_RISK_MEDIUM_AFTER_TIMEOUT", "WARN"},
-		{"TRIGGERED PENDING timeout", "TRIGGERED", pending, true, KytActionManualReview, KytPending, ReasonKytTimeoutStillPending, "ERROR"},
-		{"TRIGGERED FAILED timeout", "TRIGGERED", failed, true, KytActionManualReview, KytFailed, ReasonKytProviderFailedAfterTimeout, "WARN"},
-		{"TRIGGERED SKIPPED timeout", "TRIGGERED", skipped, true, KytActionManualReview, KytSkipped, ReasonKytSkippedAfterTimeout, "WARN"},
-		{"TRIGGERED UNKNOWN timeout", "TRIGGERED", unknown, true, KytActionManualReview, KytUnknown, "KYT_RISK_UNKNOWN_AFTER_TIMEOUT", "WARN"},
+		{"IN_PROGRESS timeout", "IN_PROGRESS", nil, true, KytActionManualReview, safeheron.AmlRiskPending, ReasonKytTimeoutStillPending, "ERROR"},
+		{"UNTRIGGERED timeout", "UNTRIGGERED", nil, true, KytActionManualReview, safeheron.AmlRiskUnknown, ReasonKytUntriggeredAfterTimeout, "WARN"},
+		{"TRIGGERED LOW timeout", "TRIGGERED", low, true, KytActionCredit, safeheron.AmlRiskLow, "", ""},
+		{"TRIGGERED HIGH timeout", "TRIGGERED", high, true, KytActionManualReview, safeheron.AmlRiskHigh, "KYT_RISK_HIGH_AFTER_TIMEOUT", "ERROR"},
+		{"TRIGGERED SEVERE timeout", "TRIGGERED", severe, true, KytActionManualReview, safeheron.AmlRiskSevere, "KYT_RISK_SEVERE_AFTER_TIMEOUT", "ERROR"},
+		{"TRIGGERED MEDIUM timeout", "TRIGGERED", medium, true, KytActionManualReview, safeheron.AmlRiskMedium, "KYT_RISK_MEDIUM_AFTER_TIMEOUT", "WARN"},
+		{"TRIGGERED PENDING timeout", "TRIGGERED", pending, true, KytActionManualReview, safeheron.AmlRiskPending, ReasonKytTimeoutStillPending, "ERROR"},
+		{"TRIGGERED FAILED timeout", "TRIGGERED", failed, true, KytActionManualReview, safeheron.AmlRiskFailed, ReasonKytProviderFailedAfterTimeout, "WARN"},
+		{"TRIGGERED SKIPPED timeout", "TRIGGERED", skipped, true, KytActionManualReview, safeheron.AmlRiskSkipped, ReasonKytSkippedAfterTimeout, "WARN"},
+		{"TRIGGERED UNKNOWN timeout", "TRIGGERED", unknown, true, KytActionManualReview, safeheron.AmlRiskUnknown, "KYT_RISK_UNKNOWN_AFTER_TIMEOUT", "WARN"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -119,12 +85,12 @@ func TestAlertLevelForKyt(t *testing.T) {
 		risk string
 		want string
 	}{
-		{KytHigh, "ERROR"},
-		{KytSevere, "ERROR"},
-		{KytLow, "WARN"},
-		{KytMedium, "WARN"},
-		{KytUnknown, "WARN"},
-		{KytFailed, "WARN"},
+		{safeheron.AmlRiskHigh, "ERROR"},
+		{safeheron.AmlRiskSevere, "ERROR"},
+		{safeheron.AmlRiskLow, "WARN"},
+		{safeheron.AmlRiskMedium, "WARN"},
+		{safeheron.AmlRiskUnknown, "WARN"},
+		{safeheron.AmlRiskFailed, "WARN"},
 	}
 	for _, tt := range tests {
 		if got := AlertLevelForKyt(tt.risk); got != tt.want {

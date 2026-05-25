@@ -7,8 +7,9 @@ import (
 )
 
 type ApprovalDecision struct {
-	Action string // APPROVE / REJECT
-	Reason string
+	Action       string // APPROVE / REJECT
+	Reason       string
+	AmlRiskLevel string // v1.1 Phase 1: AML 等级快照，非 AUTO_SWEEP/UTXO_COLLECTION 时为空
 }
 
 type Approver interface {

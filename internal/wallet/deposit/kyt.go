@@ -7,19 +7,8 @@ import (
 	"monera-digital/internal/safeheron"
 )
 
-// KYT 风险等级（业务汇总，来自 SPEC §6.5.1 处置矩阵）。
-// SummarizeRiskLevel 返回值 / deposits.aml_risk_level 列取值。
-const (
-	KytLow     = "LOW"
-	KytMedium  = "MEDIUM"
-	KytHigh    = "HIGH"
-	KytSevere  = "SEVERE"
-	KytUnknown = "UNKNOWN"
-	KytFailed  = "FAILED"
-	KytSkipped = "SKIPPED"
-	KytPending = "PENDING"
-	KytEmpty   = "EMPTY"
-)
+// KYT 风险等级常量已迁移到 safeheron 包（v1.1 §13.5.1）。
+// 调用方请使用 safeheron.AmlRiskLow / AmlRiskMedium / ... / AmlRiskEmpty。
 
 // KYT 失败原因码（deposits.failed_reason 列）。
 // 初查路径不带后缀；超时兜底路径带 _AFTER_TIMEOUT，运营一眼可区分。
@@ -48,69 +37,10 @@ func BuildKytTimeoutRiskReason(riskLevel string) string {
 	return ReasonKytRiskPrefix + riskLevel + "_AFTER_TIMEOUT"
 }
 
-// riskSeverity 返回风险等级的数值严重度，数值越大越严重。
-func riskSeverity(level string) int {
-	switch level {
-	case KytLow:
-		return 1
-	case KytMedium:
-		return 2
-	case KytUnknown:
-		return 3
-	case KytHigh:
-		return 4
-	case KytSevere:
-		return 5
-	default:
-		return 3 // 未知 riskLevel 视同 UNKNOWN
-	}
-}
-
-// SummarizeRiskLevel 取 amlList 中所有 provider 的最高严重度。
-// 优先级：PENDING > FAILED > SKIPPED > riskLevel 比较。
-func SummarizeRiskLevel(amlList []safeheron.AmlReport) string {
-	if len(amlList) == 0 {
-		return KytEmpty
-	}
-	hasPending := false
-	hasFailed := false
-	hasSkipped := false
-	maxSev := 0
-	maxLevel := KytLow
-
-	for _, r := range amlList {
-		switch r.Status {
-		case "PENDING":
-			hasPending = true
-		case "FAILED":
-			hasFailed = true
-		case "SKIPPED":
-			hasSkipped = true
-		case "COMPLETED":
-			sev := riskSeverity(r.RiskLevel)
-			if sev > maxSev {
-				maxSev = sev
-				maxLevel = r.RiskLevel
-			}
-		}
-	}
-
-	if hasPending {
-		return KytPending
-	}
-	if hasFailed {
-		return KytFailed
-	}
-	if hasSkipped {
-		return KytSkipped
-	}
-	return maxLevel
-}
-
 // AlertLevelForKyt 把 KYT 风险等级映射到告警级别（K-17）。
 func AlertLevelForKyt(riskLevel string) string {
 	switch riskLevel {
-	case KytHigh, KytSevere:
+	case safeheron.AmlRiskHigh, safeheron.AmlRiskSevere:
 		return "ERROR"
 	default:
 		return "WARN"
@@ -140,12 +70,12 @@ func DecideKYT(state string, amlList []safeheron.AmlReport, isAfterTimeout bool)
 		if isAfterTimeout {
 			return KytDecision{
 				Action:     KytActionManualReview,
-				RiskLevel:  KytPending,
+				RiskLevel:  safeheron.AmlRiskPending,
 				Reason:     ReasonKytTimeoutStillPending,
 				AlertLevel: "ERROR",
 			}
 		}
-		return KytDecision{Action: KytActionKeepPending, RiskLevel: KytPending}
+		return KytDecision{Action: KytActionKeepPending, RiskLevel: safeheron.AmlRiskPending}
 
 	case "UNTRIGGERED":
 		reason := ReasonKytUntriggered
@@ -154,7 +84,7 @@ func DecideKYT(state string, amlList []safeheron.AmlReport, isAfterTimeout bool)
 		}
 		return KytDecision{
 			Action:     KytActionManualReview,
-			RiskLevel:  KytUnknown,
+			RiskLevel:  safeheron.AmlRiskUnknown,
 			Reason:     reason,
 			AlertLevel: "WARN",
 		}
@@ -165,52 +95,52 @@ func DecideKYT(state string, amlList []safeheron.AmlReport, isAfterTimeout bool)
 	default:
 		return KytDecision{
 			Action:     KytActionManualReview,
-			RiskLevel:  KytUnknown,
+			RiskLevel:  safeheron.AmlRiskUnknown,
 			Reason:     ReasonKytUnknownState,
 			AlertLevel: "ERROR",
 		}
 	}
 
-	risk := SummarizeRiskLevel(amlList)
+	risk := safeheron.SummarizeAmlRiskLevel(amlList)
 	switch risk {
-	case KytEmpty:
+	case safeheron.AmlRiskEmpty:
 		return KytDecision{
 			Action:     KytActionManualReview,
-			RiskLevel:  KytEmpty,
+			RiskLevel:  safeheron.AmlRiskEmpty,
 			Reason:     ReasonKytEmptyAmlList,
 			AlertLevel: "WARN",
 		}
-	case KytPending:
+	case safeheron.AmlRiskPending:
 		if isAfterTimeout {
 			return KytDecision{
 				Action:     KytActionManualReview,
-				RiskLevel:  KytPending,
+				RiskLevel:  safeheron.AmlRiskPending,
 				Reason:     ReasonKytTimeoutStillPending,
 				AlertLevel: "ERROR",
 			}
 		}
-		return KytDecision{Action: KytActionKeepPending, RiskLevel: KytPending}
-	case KytLow:
-		return KytDecision{Action: KytActionCredit, RiskLevel: KytLow}
-	case KytFailed:
+		return KytDecision{Action: KytActionKeepPending, RiskLevel: safeheron.AmlRiskPending}
+	case safeheron.AmlRiskLow:
+		return KytDecision{Action: KytActionCredit, RiskLevel: safeheron.AmlRiskLow}
+	case safeheron.AmlRiskFailed:
 		reason := ReasonKytProviderFailed
 		if isAfterTimeout {
 			reason = ReasonKytProviderFailedAfterTimeout
 		}
 		return KytDecision{
 			Action:     KytActionManualReview,
-			RiskLevel:  KytFailed,
+			RiskLevel:  safeheron.AmlRiskFailed,
 			Reason:     reason,
 			AlertLevel: "WARN",
 		}
-	case KytSkipped:
+	case safeheron.AmlRiskSkipped:
 		reason := ReasonKytSkipped
 		if isAfterTimeout {
 			reason = ReasonKytSkippedAfterTimeout
 		}
 		return KytDecision{
 			Action:     KytActionManualReview,
-			RiskLevel:  KytSkipped,
+			RiskLevel:  safeheron.AmlRiskSkipped,
 			Reason:     reason,
 			AlertLevel: "WARN",
 		}

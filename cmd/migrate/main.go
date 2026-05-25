@@ -47,6 +47,9 @@ func main() {
 	// Approval Callback Service: approval_records + sweep_transactions
 	migrator.Register(&migrations.CreateApprovalAndSweepTables{})
 
+	// v1.1 Phase 1 AML hard block: approval_records.aml_risk_level
+	migrator.Register(&migrations.AddAmlRiskLevelToApprovalRecords{})
+
 	if err := migrator.Migrate(); err != nil {
 		log.Fatal("Migration failed:", err)
 	}

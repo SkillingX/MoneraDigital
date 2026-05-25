@@ -38,8 +38,8 @@ func (r *DBRepository) InsertApprovalRecord(ctx context.Context, rec *ApprovalRe
 		    tx_key, chain_symbol, coin_key, tx_amount,
 		    source_account_key, destination_account_key,
 		    destination_account_type, destination_address,
-		    customer_ref_id, raw_request)
-		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+		    customer_ref_id, raw_request, aml_risk_level)
+		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
 		 ON CONFLICT (approval_id) DO NOTHING
 		 RETURNING id, created_at`,
 		rec.ApprovalID, rec.CallbackType, nilIfEmpty(rec.TxType),
@@ -49,6 +49,7 @@ func (r *DBRepository) InsertApprovalRecord(ctx context.Context, rec *ApprovalRe
 		nilIfEmpty(rec.SourceAccountKey), nilIfEmpty(rec.DestinationAccountKey),
 		nilIfEmpty(rec.DestinationAccountType), nilIfEmpty(rec.DestinationAddress),
 		nilIfEmpty(rec.CustomerRefID), rec.RawRequest,
+		nilIfEmpty(rec.AmlRiskLevel),
 	).Scan(&rec.ID, &rec.CreatedAt)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -67,7 +68,8 @@ func (r *DBRepository) GetApprovalByID(ctx context.Context, approvalID string) (
 		        COALESCE(coin_key, ''), COALESCE(tx_amount, ''),
 		        COALESCE(source_account_key, ''), COALESCE(destination_account_key, ''),
 		        COALESCE(destination_account_type, ''), COALESCE(destination_address, ''),
-		        COALESCE(customer_ref_id, ''), raw_request, created_at
+		        COALESCE(customer_ref_id, ''), raw_request,
+		        COALESCE(aml_risk_level, ''), created_at
 		 FROM approval_records WHERE approval_id = $1`,
 		approvalID,
 	)
@@ -79,7 +81,8 @@ func (r *DBRepository) GetApprovalByID(ctx context.Context, approvalID string) (
 		&rec.CoinKey, &rec.TxAmount,
 		&rec.SourceAccountKey, &rec.DestinationAccountKey,
 		&rec.DestinationAccountType, &rec.DestinationAddress,
-		&rec.CustomerRefID, &rec.RawRequest, &rec.CreatedAt,
+		&rec.CustomerRefID, &rec.RawRequest,
+		&rec.AmlRiskLevel, &rec.CreatedAt,
 	); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrApprovalNotFound

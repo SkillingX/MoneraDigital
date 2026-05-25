@@ -1,9 +1,16 @@
 # Approval Callback Service — 技术规格
 
-> **版本**: v1.0
-> **日期**: 2026-05-21
-> **状态**: DRAFT — 待用户确认后施工
+> **版本**: v1.1（v1.0 主体已实现并合并；v1.1 为 AML 风险分级增强，见 §13）
+> **日期**: 2026-05-21（v1.0）/ 2026-05-25（v1.1）
+> **状态**: v1.0 已合并到 dev，v1.1 §13 DRAFT — 待用户确认后施工
 > **分支**: dev
+
+## 修订记录
+
+| 版本 | 日期 | 内容 |
+|------|------|------|
+| v1.0 | 2026-05-21 | 初稿；归集审批主体（VAULT_ACCOUNT + 白名单 + 幂等） |
+| v1.1 | 2026-05-25 | 新增 §13 AML 风险分级（Phase 1 硬封堵 + Phase 2 分级 override），修订 §4.3 / §5.2 注脚指向 §13 |
 
 ---
 
@@ -269,6 +276,8 @@ type Approver interface {
 
 > **命名区分**：Safeheron API 返回的 JSON 字段名为 `transactionType`（Go struct tag 不可改），我们的 DB 字段和 env 变量统一使用 `tx_type`。
 
+> ⚠️ **v1.1 增强**：AUTO_SWEEP / UTXO_COLLECTION 在以下白名单校验之后，**新增一步 AML 风险校验**。详见 §13。本节 v1.0 内容描述未做 AML 校验前的设计，仅作历史记录。
+
 #### AUTO_SWEEP
 
 | 校验维度 | 规则 | REJECT 条件 |
@@ -379,6 +388,8 @@ CREATE INDEX idx_approval_records_action ON approval_records(action);
 ```
 
 ### 5.2 sweep_transactions 表（归集流水）
+
+> ⚠️ **v1.1 Phase 2 扩展**：将新增 `aml_risk_level VARCHAR(16)` + `override_id BIGINT REFERENCES sweep_review_overrides(id)` 两列。详见 §13.4。
 
 ```sql
 CREATE TABLE IF NOT EXISTS sweep_transactions (
@@ -611,3 +622,335 @@ COSIGNER_ALLOWED_IPS=
 | 3 | MPC_SIGN / WEB3_SIGN 审批 | 默认 REJECT | 有业务需求时实现 |
 | 4 | 审批策略从 env 迁移到 DB | env 配置 | 需要动态调整时迁移 |
 | 5 | Co-Signer 回调 IP 是否与 webhook IP 相同 | 可选独立配置 | 部署时确认 |
+| 6 | AML 风险分级（v1.1）的 4 项实测依赖 | 见 §13.10 | 主流程跑通后定稿 Phase 2 |
+
+---
+
+## 13. AML 风险分级（v1.1 新增）
+
+### 13.0 背景
+
+v1.0 的 `evaluateAutoSweep` / `evaluateUTXOCollection` 仅校验 `destinationAccountType == VAULT_ACCOUNT` + 目标账户白名单，**未读取** callback detail 中的 `amlScreeningTriggeredState` / `amlList`，存在合规缺口：充值侧已被判定为 MEDIUM/HIGH 的可疑资金，仍会触发 AUTO_SWEEP 被自动归集到平台主 vault。
+
+v1.1 引入 AML 分级处置 + 审核覆盖机制。**因当前归集主流程尚未在测试/生产跑通过任何一笔真实 AUTO_SWEEP**，完整方案分两阶段交付：
+
+| 阶段 | 触发时机 | 行为 | 依赖 |
+|------|---------|------|------|
+| Phase 1（硬封堵） | 立即施工 | 仅 `TRIGGERED + LOW` APPROVE，其余一律 REJECT | 不依赖任何实测数据 |
+| Phase 2（分级 + override） | 主流程跑通且 §13.10 4 项实测点确认后 | LOW APPROVE / MEDIUM 可被运营覆盖 / HIGH 永久 REJECT | 依赖 §13.10 |
+
+### 13.1 用户已确认的决策
+
+| # | 决策项 | 选择 | 备注 |
+|---|--------|------|------|
+| D-AML-1 | AML 数据源 | 归集回调字段（`amlScreeningTriggeredState` + `amlList`） | 不交叉查 deposits 表，每次归集独立判断 |
+| D-AML-2 | MEDIUM 落地机制 | REJECT + `sweep_review_overrides` 覆盖表（Phase 2） | Phase 1 期间 MEDIUM 同 HIGH 处理 |
+| D-AML-3 | 非标准 AML 状态归类 | 全部 REJECT（fail closed） | UNTRIGGERED / PENDING / FAILED / SKIPPED / EMPTY / UNKNOWN / 字段缺失一律拒绝 |
+| D-AML-4 | Override 粒度 | `approval_id` 一次性 | UNIQUE 索引；`consumed_at` 标记单次消费 |
+| D-AML-5 | 改动范围 | `evaluateAutoSweep` + `evaluateUTXOCollection` | `evaluateAutoFuel` 不改（gas 反向无 AML 风险） |
+| D-AML-6 | 节奏 | Phase 1 立即 + Phase 2 待实测 | 避免主流程上线后默认放行所有等级 |
+| D-AML-7 | Phase 1 告警级别 | 一律 `WARN`（不分等级） | 真实 amlList 字段取值未观察前不分级，避免误分 |
+| D-AML-8 | sweep_transactions 字段扩展 | Phase 2 扩展 `aml_risk_level` + `override_id` | Phase 1 不动 schema |
+| D-AML-9 | Admin API 鉴权 | 临时方案：`ADMIN_API_TOKEN` env + `X-Admin-Token` Header | Phase 2 上线方案；后续接入正式鉴权 |
+| D-AML-10 | `SummarizeRiskLevel` 复用方式 | 上提到 `internal/safeheron/aml.go` | approval / deposit 都依赖 safeheron，方向干净；deposit 改 import 路径（3 处） |
+| D-AML-11 | Phase 1 schema 变更 | `approval_records` 表新增 `aml_risk_level VARCHAR(32)` 列（migration 024；review 时发现 `STATE_UNTRIGGERED` 等复合标签超 16 字符，扩至 32） | Phase 2 的 `sweep_review_overrides` 表 + `sweep_transactions` 扩展顺延为 migration 025 |
+| D-AML-12 | 非生产环境 bypass 开关 | 不引入 | Sepolia 测试网 AUTO_SWEEP 全 REJECT 是预期行为，归集联调必须用主网真币 |
+
+### 13.2 决策矩阵（Phase 2 终态）
+
+| `amlScreeningTriggeredState` | `SummarizeRiskLevel(amlList)` | Phase 1 行为 | Phase 2 行为 | 飞书告警（Phase 2） |
+|------------------------------|-------------------------------|--------------|--------------|---------------------|
+| `TRIGGERED` | `LOW` | APPROVE | APPROVE | — |
+| `TRIGGERED` | `MEDIUM` | REJECT | REJECT，命中 override → APPROVE | WARN |
+| `TRIGGERED` | `HIGH` / `SEVERE` | REJECT | REJECT（不可 override） | ERROR |
+| `TRIGGERED` | `UNKNOWN` | REJECT | REJECT（不可 override） | ERROR |
+| `TRIGGERED` | `PENDING` / `FAILED` / `SKIPPED` / `EMPTY` | REJECT | REJECT（不可 override） | WARN |
+| `UNTRIGGERED` / `IN_PROGRESS` / 其他 state / 空字符串 | — | REJECT | REJECT（不可 override） | WARN |
+| 解析失败 / amlList 非法 JSON | — | REJECT | REJECT（不可 override） | ERROR |
+
+> 与充值侧 `internal/wallet/deposit/kyt.go` 的 `DecideKYT` 矩阵刻意不同：充值已发生无法退回，所以 MEDIUM 走 MANUAL_REVIEW；归集是主动行为，fail closed 更安全。
+
+### 13.3 模块划分
+
+```
+internal/
+├── safeheron/
+│   └── aml.go                    # 新增（Phase 1）：SummarizeRiskLevel 从 wallet/deposit/kyt.go 迁移过来 (D-AML-10)
+├── wallet/deposit/
+│   └── kyt.go                    # 修改（Phase 1）：SummarizeRiskLevel 删除后改调 safeheron.SummarizeAmlRiskLevel；调用点 3 处改 import
+├── approval/
+│   ├── sweep_aml.go              # 新增（Phase 1）：DecideSweepAML + SweepAMLDecision
+│   ├── sweep_aml_test.go         # 新增（Phase 1）：决策矩阵全覆盖测试
+│   ├── transaction_approver.go   # 修改（Phase 1）：evaluateAutoSweep / evaluateUTXOCollection 加 AML 步骤 + 写入 aml_risk_level
+│   ├── service.go                # 修改（Phase 1）：approval_records 写 aml_risk_level 字段；Phase 2 注入 OverrideRepo + 告警分级
+│   ├── repository.go             # 修改（Phase 1）：InsertApprovalRecord 写 aml_risk_level；Phase 2 扩展 sweep_review_overrides CRUD
+│   ├── models.go                 # 修改（Phase 1）：ApprovalRecord 加 AmlRiskLevel 字段；Phase 2 加 SweepReviewOverride struct
+├── handlers/
+│   └── admin_sweep_handler.go    # 新增（Phase 2）：HTTP API
+├── middleware/
+│   └── admin_token.go            # 新增（Phase 2）：X-Admin-Token 鉴权
+├── migration/migrations/
+│   ├── 024_add_aml_risk_level_to_approval_records.go  # 新增（Phase 1）：approval_records 加 aml_risk_level 列
+│   └── 025_sweep_aml_phase2.go                        # 新增（Phase 2）：sweep_review_overrides 表 + sweep_transactions 扩展
+└── routes/
+    └── routes.go                 # 修改（Phase 2）：注册 /api/admin/sweep/*
+```
+
+### 13.4 数据库变更
+
+#### 13.4.1 Phase 1 — `approval_records` 扩展（migration 024）
+
+```sql
+ALTER TABLE approval_records ADD COLUMN IF NOT EXISTS aml_risk_level VARCHAR(32);
+CREATE INDEX IF NOT EXISTS idx_approval_records_aml_risk ON approval_records(aml_risk_level);
+```
+
+**字段含义**：审批时由 `DecideSweepAML` 返回的 `RiskLevel` 快照，取值集合见 §13.5。允许 NULL（CALLBACK_TEST / MPC_SIGN / WEB3_SIGN / 旧记录无此字段）。
+
+> 历史数据无需回填，新列默认 NULL。
+
+#### 13.4.2 Phase 2 — 新表 `sweep_review_overrides`（migration 025）
+
+```sql
+CREATE TABLE IF NOT EXISTS sweep_review_overrides (
+    id              BIGSERIAL    PRIMARY KEY,
+    approval_id     VARCHAR(128) NOT NULL UNIQUE,
+    tx_key          VARCHAR(128),
+    risk_level      VARCHAR(16)  NOT NULL,    -- 审核时的 AML 等级快照
+    reason          TEXT         NOT NULL,    -- 运营备注
+    reviewer        VARCHAR(128) NOT NULL,    -- 操作员标识（X-Admin-Reviewer Header）
+    consumed_at     TIMESTAMPTZ,              -- 首次被 callback 消费的时间
+    expires_at      TIMESTAMPTZ  NOT NULL,    -- 默认 created_at + 24h
+    created_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_sweep_review_overrides_expires
+    ON sweep_review_overrides(expires_at) WHERE consumed_at IS NULL;
+```
+
+#### 13.4.3 Phase 2 — `sweep_transactions` 扩展（migration 025）
+
+```sql
+ALTER TABLE sweep_transactions ADD COLUMN IF NOT EXISTS aml_risk_level VARCHAR(16);
+ALTER TABLE sweep_transactions ADD COLUMN IF NOT EXISTS override_id BIGINT REFERENCES sweep_review_overrides(id);
+```
+
+#### 13.4.4 消费语义（D-AML-4）
+
+| 状态 | 行为 |
+|------|------|
+| 未消费 + 未过期 | callback 命中时原子标记 `consumed_at = NOW()` → APPROVE |
+| 已消费 | callback 命中视同未命中 → REJECT (MEDIUM) |
+| 已过期（`expires_at < NOW()`） | callback 命中视同未命中 → REJECT (MEDIUM) |
+
+**原子性 SQL**：
+
+```sql
+UPDATE sweep_review_overrides
+   SET consumed_at = NOW()
+ WHERE approval_id = $1 AND consumed_at IS NULL AND expires_at > NOW()
+RETURNING id, risk_level, reviewer;
+```
+
+受影响 0 行 = 未命中或已被并发消费。
+
+### 13.5 决策函数 `DecideSweepAML`
+
+#### 13.5.1 `SummarizeRiskLevel` 迁移到 safeheron 包（D-AML-10）
+
+**Phase 1 第 0 步**（前置重构，零行为变更）：把 `wallet/deposit/kyt.go` 中的 `SummarizeRiskLevel` + `riskSeverity` + `KytLow`/`KytMedium`/`KytHigh`/`KytSevere`/`KytUnknown`/`KytFailed`/`KytSkipped`/`KytPending`/`KytEmpty` 常量迁移到新文件 `internal/safeheron/aml.go`：
+
+| 旧路径 | 新路径 |
+|--------|--------|
+| `deposit.SummarizeRiskLevel(amlList)` | `safeheron.SummarizeAmlRiskLevel(amlList)` |
+| `deposit.KytLow` / `KytMedium` / ... | `safeheron.AmlRiskLow` / `AmlRiskMedium` / ... |
+
+deposit 包改动：
+- `kyt.go` 删除上述函数 + 常量定义
+- 包内调用点（`DecideKYT` 等）改为 `safeheron.SummarizeAmlRiskLevel(...)` + `safeheron.AmlRisk*` 常量
+- `deposit.Kyt*` 常量保留为 deposit-only 业务码（`KytSkipped` / `KytSkipped` / `KytFailed` 等的 deposit 语义如果与 safeheron 通用不同，则二者并存）
+
+> 实施时必须验证：**充值侧 `service_kyt_test.go` 全部测试不变绿才能进 Phase 1 下一步**。这是零行为变更前置重构的硬约束。
+
+#### 13.5.2 `DecideSweepAML` 设计
+
+**Phase 1**（`internal/approval/sweep_aml.go`）：
+
+```go
+type SweepAMLDecision struct {
+    Approve   bool
+    RiskLevel string  // LOW / MEDIUM / HIGH / SEVERE / UNKNOWN / PENDING / FAILED / SKIPPED / EMPTY / UNTRIGGERED / IN_PROGRESS / PARSE_FAILED / STATE_<原始值>
+    Reason    string  // SWEEP_AML_OK / SWEEP_AML_RISK_<LEVEL> / SWEEP_AML_STATE_<STATE> / SWEEP_AML_PARSE_FAILED
+}
+
+// 仅 TRIGGERED + LOW 放行。复用 safeheron.SummarizeAmlRiskLevel 做 amlList 聚合。
+func DecideSweepAML(state string, amlListRaw json.RawMessage) SweepAMLDecision { ... }
+```
+
+`approval_records.aml_risk_level` 字段写入 `SweepAMLDecision.RiskLevel`。
+
+**Phase 2 扩展**：在 `SweepAMLDecision` 加 `CanOverride bool` 字段（向后兼容），并把 Phase 1 二元结果改三元（APPROVE / REJECT-overridable / REJECT-final）。
+
+> **不复用 `DecideKYT`**：充值侧矩阵有 `KEEP_PENDING`（等待），归集 callback 无此语义；且 MEDIUM 处置策略不同。但底层 `SummarizeRiskLevel` 必须复用，避免双份维护。
+
+### 13.6 审批流程改造
+
+#### Phase 1
+
+`evaluateAutoSweep` 在现有"VAULT_ACCOUNT + 白名单"校验之后，**新增第 3 步**：
+
+```go
+amlDecision := DecideSweepAML(detail.AmlScreeningTriggeredState, detail.AmlList)
+if !amlDecision.Approve {
+    return &ApprovalDecision{Action: "REJECT", Reason: amlDecision.Reason}, nil
+}
+return &ApprovalDecision{Action: "APPROVE", Reason: "AUTO_SWEEP approved (AML=LOW)"}, nil
+```
+
+`evaluateUTXOCollection` 同样改造。`evaluateAutoFuel` **不动**（D-AML-5）。
+
+#### Phase 2
+
+`TransactionApprover` 注入 `OverrideLookup` 接口：
+
+```go
+type OverrideLookup interface {
+    ConsumeOverride(ctx context.Context, approvalID string) (matched bool, riskLevel, reviewer string, err error)
+}
+```
+
+`evaluateAutoSweep` 的 AML 分支扩展为三元：
+
+```go
+switch amlDecision.Action {
+case SweepAMLApprove:
+    // APPROVE
+case SweepAMLRejectFinal:
+    // REJECT，记录 HIGH/SEVERE/异常 reason
+case SweepAMLRejectOverridable:
+    if matched, _, reviewer, _ := a.overrides.ConsumeOverride(ctx, biz.ApprovalId); matched {
+        // APPROVE via override，reason 含 reviewer
+    } else {
+        // REJECT (MEDIUM)
+    }
+}
+```
+
+### 13.7 Admin API（Phase 2）
+
+```
+POST   /api/admin/sweep/review-override    # 创建 override
+GET    /api/admin/sweep/pending-reviews    # 列出可覆盖的 REJECT 记录
+GET    /api/admin/sweep/overrides          # 列出 override 历史
+```
+
+**鉴权**（D-AML-9）：`X-Admin-Token` Header 匹配 `ADMIN_API_TOKEN` env。Token 配置为空时路由不注册（与 cosigner 密钥缺失同模式）。`reviewer` 字段从 `X-Admin-Reviewer` Header 取，缺失则 400。
+
+**POST 请求体**：
+
+```json
+{
+  "approvalId": "abc123",
+  "reason": "运营 XXX 已核实地址 0x... 与合规白名单匹配",
+  "expiresInMinutes": 60   // 可选，默认 1440 (24h)，上限 4320 (72h)
+}
+```
+
+**服务端校验**：
+- `approvalId` 必填，前置在 `approval_records` 中存在且 `action=REJECT` 且 `reason` 含 `SWEEP_AML_RISK_MEDIUM`（防误覆盖 HIGH）
+- `reason` 必填，长度 ≥ 10
+- UNIQUE 冲突 → 409
+
+### 13.8 告警分级
+
+| 场景 | Phase 1 级别 | Phase 2 级别 | 飞书内容 |
+|------|-------------|-------------|---------|
+| REJECT (LOW 之外的所有等级) | WARN（D-AML-7） | 按 §13.2 矩阵 | approvalId / txKey / sourceAddress / coinKey / txAmount / riskLevel |
+| REJECT (HIGH / SEVERE / UNKNOWN / 解析失败) | — | ERROR | 同上 |
+| REJECT (MEDIUM) | — | WARN + 提示 `/api/admin/sweep/review-override` | 同上 |
+| APPROVE via override | — | WARN | approvalId / reviewer / 原 AML 等级（留痕） |
+| APPROVE (LOW) | — | — | 不告警 |
+
+### 13.9 环境变量（Phase 2 新增）
+
+```env
+ADMIN_API_TOKEN=                              # 32+ 随机字节，留空则不注册 /api/admin/sweep/*
+SWEEP_OVERRIDE_DEFAULT_EXPIRY_MINUTES=1440    # 24h
+SWEEP_OVERRIDE_MAX_EXPIRY_MINUTES=4320        # 72h
+```
+
+### 13.10 实测依赖（Phase 2 定稿前必须验证）
+
+主流程跑通后需观察以下 4 项，结果可能改变 Phase 2 设计：
+
+| # | 问题 | 影响 |
+|---|------|------|
+| O-AML-1 | Safeheron 重试同笔归集时 `approvalId` 是否保持不变 | 若不一致，§13.4 的 `approval_id` UNIQUE 索引失效，需改成 `tx_key` 粒度 |
+| O-AML-2 | Safeheron 内部重试节奏（首次 REJECT 后多久重发 callback） | 决定 §13.7 的 `expiresInMinutes` 默认值。若 > 24h 才重试，需主动调用 Safeheron API 重新触发归集 |
+| O-AML-3 | AUTO_FUEL callback 是否携带 `amlScreeningTriggeredState` | D-AML-5 假设 AUTO_FUEL 反向无 AML 风险。若 Safeheron 仍带 AML 字段且期待审批，需扩展 |
+| O-AML-4 | 真实 `amlList` 的 `provider` / `status` / `riskLevel` 取值 | 若与充值侧 `DecideKYT` 期望值不一致，`SummarizeRiskLevel` 可能误判等级 |
+
+### 13.11 风险
+
+| 风险 | 概率 | 缓解 |
+|------|------|------|
+| 测试网 (Sepolia) AML 默认 UNTRIGGERED，Phase 1 全 REJECT 阻塞联调 | 高 | 预期行为；测试归集必须用主网真币（与 `t12_mainnet_validation` 一致） |
+| Phase 1 拒绝导致地址池资金累积，超 Safeheron 余额上限 | 中 | 部署前确认 Safeheron 归集策略可手动暂停；告知运营这是过渡期 |
+| Phase 1 期间 MEDIUM 全部 REJECT 累积 | 低 | Phase 2 上线后运营批量回查 `approval_records` 并在 Safeheron Console 手动触发归集 |
+| Phase 2 实测发现 O-AML-1 不成立（approvalId 每次不同） | 中 | 设计已留 `tx_key` 字段作 fallback；改 UNIQUE 索引到 `tx_key` |
+| 临时鉴权方案 `ADMIN_API_TOKEN` 泄露 | 中 | env 管控 + 部署文档强调 + 后续接入正式鉴权（如 JWT role） |
+| 运营误用 override 放行 HIGH | 低 | §13.7 服务端校验 `reason` 必须含 `SWEEP_AML_RISK_MEDIUM`；reviewer 审计留痕 |
+
+### 13.12 实现步骤
+
+#### Phase 1（立即施工）
+
+| # | 任务 | 检查点 |
+|---|------|--------|
+| 0 | **前置重构**：`SummarizeRiskLevel` + `KytLow`/`KytMedium`/... 常量从 `wallet/deposit/kyt.go` 迁移到 `safeheron/aml.go`；deposit 包内调用点改 import | 全量 `go test ./internal/wallet/deposit/...` 通过（零行为变更）|
+| 1 | Migration 024：`approval_records` 加 `aml_risk_level VARCHAR(32)` 列 + 索引 | `go run ./cmd/migrate/` 成功；migration test 通过 |
+| 2 | 写 `sweep_aml.go` + `sweep_aml_test.go`（先 RED，矩阵全覆盖）| 单测全部失败 |
+| 3 | 实现 `DecideSweepAML` 使单测 GREEN | `sweep_aml.go` 行覆盖 100% |
+| 4 | `models.go` ApprovalRecord 加 AmlRiskLevel 字段；`repository.go` InsertApprovalRecord 写入新列 | repository_test sqlmock 通过 |
+| 5 | 修改 `transaction_approver.go` 加 AML 步骤 + 把 `DecideSweepAML` 结果传给 service 落库 | `evaluateAutoSweep` / `evaluateUTXOCollection` 双改 |
+| 6 | 扩展 `transaction_approver_test.go` + service-level 测试 | 新增 9 条增量场景 + service 写库测试 |
+| 7 | `go test ./... -race -cover` + `go vet ./...` + `go build ./cmd/server/` | 无回归，覆盖率达标 |
+
+#### Phase 2（主流程跑通 + §13.10 实测 4 项后）
+
+| # | 任务 | 依赖 |
+|---|------|------|
+| 1 | Migration 025（`sweep_review_overrides` 表 + `sweep_transactions` 扩展 `aml_risk_level` + `override_id`） | §13.10 实测 |
+| 2 | `repository.go` 扩展（Insert/Consume/List Override）| #1 |
+| 3 | `sweep_aml.go` 扩展为三元决策（加 `CanOverride`）| §13.10 实测 |
+| 4 | `transaction_approver.go` AML 分支改三元 + 注入 `OverrideLookup` | #2, #3 |
+| 5 | `service.go` 告警分级 + 注入 OverrideRepo + 写 `sweep_transactions.override_id` | #4 |
+| 6 | `admin_sweep_handler.go` + admin token 中间件 | #2 |
+| 7 | Container option + 路由注册 + `.env.example` | #6 |
+| 8 | 集成测试 + 全量回归 | 全部 |
+
+### 13.13 验收标准
+
+#### Phase 1
+
+1. **前置重构零行为变更**：`SummarizeRiskLevel` 迁移后 `go test ./internal/wallet/deposit/... -race` 全绿，无任何测试用例需要修改断言
+2. **LOW 放行**：mock callback `TRIGGERED + LOW` → APPROVE，`approval_records.aml_risk_level = 'LOW'`
+3. **MEDIUM 拒绝**：mock callback `TRIGGERED + MEDIUM` → REJECT，飞书 WARN，`aml_risk_level = 'MEDIUM'`
+4. **HIGH 拒绝**：mock callback `TRIGGERED + HIGH` → REJECT，飞书 WARN，`aml_risk_level = 'HIGH'`
+5. **UNTRIGGERED 拒绝**：mock callback `UNTRIGGERED` → REJECT，`aml_risk_level = 'UNTRIGGERED'`
+6. **字段缺失拒绝**：mock callback 不带 `amlScreeningTriggeredState` → REJECT，`aml_risk_level = 'STATE_MISSING'`
+7. **AUTO_FUEL 不受影响**：mock callback `type=AUTO_FUEL + AML=HIGH` → APPROVE，`aml_risk_level` 保持 NULL（AUTO_FUEL 不走 AML 校验）
+8. **UTXO_COLLECTION 与 AUTO_SWEEP 行为一致**：四条等价测试通过
+9. **回归**：现有 v1.0 全部测试通过
+10. **覆盖率** ≥ 90%（`sweep_aml.go` 目标 100%）
+
+#### Phase 2
+
+10. **MEDIUM 覆盖放行**：POST override → callback 重试 → APPROVE，`consumed_at` 标记，`sweep_transactions` 写入含 `override_id`
+11. **MEDIUM 一次性**：override 消费后再次 callback → REJECT
+12. **MEDIUM 过期**：override 超过 `expires_at` → REJECT
+13. **HIGH 不可覆盖**：POST override 时若 `approval_records` 显示 HIGH → 400
+14. **鉴权**：admin API 缺 `X-Admin-Token` / `X-Admin-Reviewer` → 401/400
+15. **降级**：未配 `ADMIN_API_TOKEN` → `/api/admin/sweep/*` 不注册
+16. **告警分级**：HIGH → ERROR；MEDIUM → WARN + 含覆盖提示；APPROVE-via-override → WARN
+17. **覆盖率** ≥ 90%

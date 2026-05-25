@@ -251,6 +251,30 @@ func TestServiceEvaluate_Idempotent(t *testing.T) {
 	}
 }
 
+func TestServiceEvaluate_Idempotent_PreservesAmlRiskLevel(t *testing.T) {
+	repo := &mockRepo{
+		insertApprovalErr: ErrDuplicateApproval,
+		getApprovalResult: &ApprovalRecord{
+			ApprovalID:   "ap-aml",
+			Action:       "REJECT",
+			Reason:       "AUTO_SWEEP rejected: SWEEP_AML_RISK_HIGH (risk=HIGH)",
+			AmlRiskLevel: "HIGH",
+		},
+	}
+	txA := NewTransactionApprover(newTestConfig(), newTestRegistry())
+	svc := NewApprovalService(repo, txA, nil)
+
+	biz := makeBizWithAML("AUTO_SWEEP", "VAULT_ACCOUNT", "acct-main", "TRIGGERED",
+		json.RawMessage(`[{"status":"COMPLETED","riskLevel":"HIGH"}]`))
+	dec, err := svc.Evaluate(context.Background(), biz)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if dec.AmlRiskLevel != "HIGH" {
+		t.Errorf("idempotent AmlRiskLevel = %q, want HIGH", dec.AmlRiskLevel)
+	}
+}
+
 func TestServiceEvaluate_Idempotent_LookupFails(t *testing.T) {
 	repo := &mockRepo{
 		insertApprovalErr: ErrDuplicateApproval,
@@ -363,14 +387,16 @@ func TestServiceEvaluate_TransactionApprove_PreservesDetailStatus(t *testing.T) 
 	svc := NewApprovalService(repo, txA, nil)
 
 	detail := safeheron.TransactionApproval{
-		TxKey:                  "tx-status",
-		CoinKey:                "ETH",
-		TxAmount:               "1.5",
-		TransactionType:        "AUTO_SWEEP",
-		TransactionStatus:      "SIGNING",
-		DestinationAccountKey:  "acct-main",
-		DestinationAccountType: "VAULT_ACCOUNT",
-		SourceAddress:          "0xsrc",
+		TxKey:                      "tx-status",
+		CoinKey:                    "ETH",
+		TxAmount:                   "1.5",
+		TransactionType:            "AUTO_SWEEP",
+		TransactionStatus:          "SIGNING",
+		DestinationAccountKey:      "acct-main",
+		DestinationAccountType:     "VAULT_ACCOUNT",
+		SourceAddress:              "0xsrc",
+		AmlScreeningTriggeredState: "TRIGGERED",
+		AmlList:                    json.RawMessage(`[{"status":"COMPLETED","riskLevel":"LOW"}]`),
 	}
 	data, _ := json.Marshal(detail)
 	biz := &safeheron.CoSignerBizContentV3{
@@ -437,19 +463,21 @@ func TestServiceEvaluate_SweepFieldsComplete(t *testing.T) {
 	svc := NewApprovalService(repo, txA, nil)
 
 	detail := safeheron.TransactionApproval{
-		TxKey:                  "tx-full",
-		TxHash:                 "0xhash123",
-		CustomerRefId:          "cust-ref-1",
-		CoinKey:                "USDT_ERC20",
-		FeeCoinKey:             "ETH",
-		TxAmount:               "500",
-		EstimateFee:            "0.005",
-		TransactionType:        "AUTO_SWEEP",
-		SourceAccountKey:       "src-acct",
-		SourceAddress:          "0xsrc",
-		DestinationAccountKey:  "acct-main",
-		DestinationAccountType: "VAULT_ACCOUNT",
-		DestinationAddress:     "0xdst",
+		TxKey:                      "tx-full",
+		TxHash:                     "0xhash123",
+		CustomerRefId:              "cust-ref-1",
+		CoinKey:                    "USDT_ERC20",
+		FeeCoinKey:                 "ETH",
+		TxAmount:                   "500",
+		EstimateFee:                "0.005",
+		TransactionType:            "AUTO_SWEEP",
+		SourceAccountKey:           "src-acct",
+		SourceAddress:              "0xsrc",
+		DestinationAccountKey:      "acct-main",
+		DestinationAccountType:     "VAULT_ACCOUNT",
+		DestinationAddress:         "0xdst",
+		AmlScreeningTriggeredState: "TRIGGERED",
+		AmlList:                    json.RawMessage(`[{"status":"COMPLETED","riskLevel":"LOW"}]`),
 	}
 	data, _ := json.Marshal(detail)
 	biz := &safeheron.CoSignerBizContentV3{
@@ -544,5 +572,134 @@ func TestServiceEvaluate_RejectAlertFields(t *testing.T) {
 	}
 	if a["destinationAddress"] != "0xabc" {
 		t.Errorf("destinationAddress = %q, want 0xabc", a["destinationAddress"])
+	}
+}
+
+// ---------------------------------------------------------------------------
+// v1.1 Phase 1: AML 等级落库 + 告警分级（spec §13.6, §13.8, D-AML-7）
+// ---------------------------------------------------------------------------
+
+func TestServiceEvaluate_AutoSweepLow_PersistsAmlRiskLevel(t *testing.T) {
+	repo := &mockRepo{}
+	alerts := &alertCapture{}
+	txA := NewTransactionApprover(newTestConfig(), newTestRegistry())
+	svc := NewApprovalService(repo, txA, alerts.fn())
+
+	biz := makeBizWithAML("AUTO_SWEEP", "VAULT_ACCOUNT", "acct-main", "TRIGGERED",
+		json.RawMessage(`[{"status":"COMPLETED","riskLevel":"LOW"}]`))
+	dec, err := svc.Evaluate(context.Background(), biz)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if dec.Action != "APPROVE" {
+		t.Fatalf("action = %q, want APPROVE; reason=%q", dec.Action, dec.Reason)
+	}
+	if repo.insertedApproval == nil {
+		t.Fatal("approval record not inserted")
+	}
+	if repo.insertedApproval.AmlRiskLevel != "LOW" {
+		t.Errorf("aml_risk_level = %q, want LOW", repo.insertedApproval.AmlRiskLevel)
+	}
+	if len(alerts.calls) != 0 {
+		t.Errorf("APPROVE should not trigger alert, got %d", len(alerts.calls))
+	}
+}
+
+func TestServiceEvaluate_AutoSweepHigh_PersistsAndAlertsWarn(t *testing.T) {
+	repo := &mockRepo{}
+	alerts := &alertCapture{}
+	txA := NewTransactionApprover(newTestConfig(), newTestRegistry())
+	svc := NewApprovalService(repo, txA, alerts.fn())
+
+	biz := makeBizWithAML("AUTO_SWEEP", "VAULT_ACCOUNT", "acct-main", "TRIGGERED",
+		json.RawMessage(`[{"status":"COMPLETED","riskLevel":"HIGH"}]`))
+	dec, _ := svc.Evaluate(context.Background(), biz)
+	if dec.Action != "REJECT" {
+		t.Fatalf("action = %q, want REJECT", dec.Action)
+	}
+	if repo.insertedApproval.AmlRiskLevel != "HIGH" {
+		t.Errorf("aml_risk_level = %q, want HIGH", repo.insertedApproval.AmlRiskLevel)
+	}
+	if repo.insertedSweep != nil {
+		t.Error("REJECT should not insert sweep transaction")
+	}
+	if len(alerts.calls) != 1 {
+		t.Fatalf("expected 1 alert call, got %d", len(alerts.calls))
+	}
+	a := alerts.calls[0]
+	if a["_level"] != "WARN" {
+		t.Errorf("alert level = %q, want WARN (D-AML-7)", a["_level"])
+	}
+	if a["riskLevel"] != "HIGH" {
+		t.Errorf("alert riskLevel = %q, want HIGH", a["riskLevel"])
+	}
+}
+
+func TestServiceEvaluate_AutoSweepStateMissing_AlertContainsStateLabel(t *testing.T) {
+	repo := &mockRepo{}
+	alerts := &alertCapture{}
+	txA := NewTransactionApprover(newTestConfig(), newTestRegistry())
+	svc := NewApprovalService(repo, txA, alerts.fn())
+
+	biz := makeBizWithAML("AUTO_SWEEP", "VAULT_ACCOUNT", "acct-main", "", nil)
+	dec, _ := svc.Evaluate(context.Background(), biz)
+	if dec.Action != "REJECT" {
+		t.Fatalf("action = %q, want REJECT", dec.Action)
+	}
+	if repo.insertedApproval.AmlRiskLevel != "STATE_MISSING" {
+		t.Errorf("aml_risk_level = %q, want STATE_MISSING", repo.insertedApproval.AmlRiskLevel)
+	}
+	if len(alerts.calls) != 1 {
+		t.Fatalf("expected 1 alert, got %d", len(alerts.calls))
+	}
+	if alerts.calls[0]["riskLevel"] != "STATE_MISSING" {
+		t.Errorf("alert riskLevel = %q, want STATE_MISSING", alerts.calls[0]["riskLevel"])
+	}
+}
+
+func TestServiceEvaluate_AutoFuel_NoAmlRiskLevel(t *testing.T) {
+	repo := &mockRepo{}
+	alerts := &alertCapture{}
+	txA := NewTransactionApprover(newTestConfig(), newTestRegistry())
+	svc := NewApprovalService(repo, txA, alerts.fn())
+
+	biz := makeBizWithAML("AUTO_FUEL", "VAULT_ACCOUNT", "acct-main", "TRIGGERED",
+		json.RawMessage(`[{"status":"COMPLETED","riskLevel":"HIGH"}]`))
+	dec, _ := svc.Evaluate(context.Background(), biz)
+	if dec.Action != "APPROVE" {
+		t.Fatalf("AUTO_FUEL with HIGH AML should still APPROVE (D-AML-5); got %q", dec.Action)
+	}
+	if repo.insertedApproval.AmlRiskLevel != "" {
+		t.Errorf("aml_risk_level = %q, want empty (AUTO_FUEL 不走 AML)", repo.insertedApproval.AmlRiskLevel)
+	}
+	if len(alerts.calls) != 0 {
+		t.Errorf("APPROVE should not alert, got %d", len(alerts.calls))
+	}
+}
+
+func TestServiceEvaluate_NonAmlReject_KeepsErrorLevel(t *testing.T) {
+	// 白名单失败：AML 步骤未执行，AmlRiskLevel 为空，告警保持 ERROR 级（非 AML 路径）。
+	repo := &mockRepo{}
+	alerts := &alertCapture{}
+	txA := NewTransactionApprover(newTestConfig(), newTestRegistry())
+	svc := NewApprovalService(repo, txA, alerts.fn())
+
+	biz := makeBizWithAML("AUTO_SWEEP", "VAULT_ACCOUNT", "unknown-acct", "TRIGGERED",
+		json.RawMessage(`[{"status":"COMPLETED","riskLevel":"LOW"}]`))
+	dec, _ := svc.Evaluate(context.Background(), biz)
+	if dec.Action != "REJECT" {
+		t.Fatalf("action = %q, want REJECT", dec.Action)
+	}
+	if repo.insertedApproval.AmlRiskLevel != "" {
+		t.Errorf("aml_risk_level = %q, want empty (AML 步骤未执行)", repo.insertedApproval.AmlRiskLevel)
+	}
+	if len(alerts.calls) != 1 {
+		t.Fatalf("expected 1 alert, got %d", len(alerts.calls))
+	}
+	if alerts.calls[0]["_level"] != "ERROR" {
+		t.Errorf("non-AML reject alert level = %q, want ERROR", alerts.calls[0]["_level"])
+	}
+	if _, has := alerts.calls[0]["riskLevel"]; has {
+		t.Errorf("non-AML reject should NOT have riskLevel field, got %q", alerts.calls[0]["riskLevel"])
 	}
 }

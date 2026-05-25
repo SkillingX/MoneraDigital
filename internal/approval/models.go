@@ -22,6 +22,7 @@ type ApprovalRecord struct {
 	DestinationAddress     string          `db:"destination_address"`
 	CustomerRefID          string          `db:"customer_ref_id"`
 	RawRequest             json.RawMessage `db:"raw_request"`
+	AmlRiskLevel           string          `db:"aml_risk_level"` // v1.1 Phase 1: AML 等级快照，非 AUTO_SWEEP/UTXO_COLLECTION 时为空（落 NULL）
 	CreatedAt              time.Time       `db:"created_at"`
 }
 

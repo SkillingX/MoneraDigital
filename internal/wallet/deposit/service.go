@@ -384,7 +384,7 @@ func (s *Service) writeAMLFields(ctx context.Context, tx Tx, depID int64, state 
 		log.Printf("AML evaluatedAt is zero (no parseable LastUpdateTime): depID=%d state=%s entries=%d", depID, state, len(amlList))
 	}
 	return s.repo.UpdateAMLFields(ctx, tx, depID,
-		state, SummarizeRiskLevel(amlList), evaluatedAt, amlListJSON)
+		state, safeheron.SummarizeAmlRiskLevel(amlList), evaluatedAt, amlListJSON)
 }
 
 // creditDepositFromRow is the shared credit helper for T-γ / ScanKYTTimeouts / processKYTAlert.

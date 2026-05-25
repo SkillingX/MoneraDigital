@@ -36,6 +36,7 @@ func TestInsertApprovalRecord_Success(t *testing.T) {
 			"tx-1", "ETH", "USDT_ERC20", "100",
 			nil, "acct-main", "VAULT_ACCOUNT", "0xabc",
 			nil, json.RawMessage(`{}`),
+			"LOW",
 		).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "created_at"}).AddRow(1, now))
 
@@ -52,6 +53,7 @@ func TestInsertApprovalRecord_Success(t *testing.T) {
 		DestinationAccountType: "VAULT_ACCOUNT",
 		DestinationAddress:     "0xabc",
 		RawRequest:             json.RawMessage(`{}`),
+		AmlRiskLevel:           "LOW",
 	}
 
 	if err := repo.InsertApprovalRecord(context.Background(), rec); err != nil {
@@ -74,6 +76,7 @@ func TestInsertApprovalRecord_Duplicate(t *testing.T) {
 			"tx-1", "ETH", "USDT_ERC20", "100",
 			nil, "acct-main", "VAULT_ACCOUNT", "0xabc",
 			nil, json.RawMessage(`{}`),
+			nil,
 		).
 		WillReturnError(sql.ErrNoRows)
 
@@ -127,6 +130,7 @@ func TestInsertApprovalRecord_CallbackTest(t *testing.T) {
 			nil, nil, nil, nil,
 			nil, nil, nil, nil,
 			nil, json.RawMessage(`{}`),
+			nil,
 		).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "created_at"}).AddRow(2, now))
 
@@ -162,7 +166,8 @@ func TestGetApprovalByID_Found(t *testing.T) {
 			"coin_key", "tx_amount",
 			"source_account_key", "destination_account_key",
 			"destination_account_type", "destination_address",
-			"customer_ref_id", "raw_request", "created_at",
+			"customer_ref_id", "raw_request",
+			"aml_risk_level", "created_at",
 		}).AddRow(
 			1, "ap-1", "TRANSACTION",
 			"AUTO_SWEEP", "APPROVE", "",
@@ -170,7 +175,8 @@ func TestGetApprovalByID_Found(t *testing.T) {
 			"USDT_ERC20", "100",
 			"", "acct-main",
 			"VAULT_ACCOUNT", "0xabc",
-			"", json.RawMessage(`{}`), now,
+			"", json.RawMessage(`{}`),
+			"HIGH", now,
 		))
 
 	rec, err := repo.GetApprovalByID(context.Background(), "ap-1")
@@ -182,6 +188,9 @@ func TestGetApprovalByID_Found(t *testing.T) {
 	}
 	if rec.ChainSymbol != "ETH" {
 		t.Errorf("chainSymbol = %q, want ETH", rec.ChainSymbol)
+	}
+	if rec.AmlRiskLevel != "HIGH" {
+		t.Errorf("amlRiskLevel = %q, want HIGH", rec.AmlRiskLevel)
 	}
 }
 
